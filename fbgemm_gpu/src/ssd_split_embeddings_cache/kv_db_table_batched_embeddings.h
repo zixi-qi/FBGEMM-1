@@ -40,7 +40,6 @@
 #include <folly/experimental/coro/Task.h>
 #include "fbgemm_gpu/split_embeddings_cache/cachelib_cache.h"
 #include "fbgemm_gpu/utils/dispatch_macros.h"
-#include "kv_db_cuda_utils.h"
 
 namespace kv_db {
 
@@ -77,19 +76,9 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
       int64_t num_shards,
       int64_t max_D,
       int64_t cache_size_gb = 0,
-      int64_t unique_id = 0)
-      : unique_id_(unique_id),
-        num_shards_(num_shards),
-        max_D_(max_D),
-        executor_tp_(
-            std::make_unique<folly::CPUThreadPoolExecutor>(num_shards)) {
-    assert(num_shards > 0);
-    l2_cache_ = cache_size_gb > 0
-        ? std::make_unique<l2_cache::CacheLibCache>(
-              cache_size_gb * 1024 * 1024 * 1024, num_shards_)
-        : nullptr;
-  }
-  virtual ~EmbeddingKVDB() = default;
+      int64_t unique_id = 0);
+
+  virtual ~EmbeddingKVDB();
 
   /// Insert non-negative elements in <indices> and its paired embeddings
   /// from <weights> for the first <count> elements in the tensor.
@@ -168,6 +157,16 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
       const int64_t timestep,
       const bool is_bwd = false);
 
+  /// export internally collected L2 performance metrics out
+  ///
+  /// @param step the training step that caller side wants to report the stats
+  /// @param interval report interval in terms of training step
+  ///
+  /// @return a list of doubles with predefined order for each metrics
+  std::vector<double> get_l2cache_perf(
+      const int64_t step,
+      const int64_t interval);
+
  private:
   /// Find non-negative embedding indices in <indices> and shard them into
   /// #cachelib_pools pieces to be lookedup in parallel
@@ -195,10 +194,10 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
   /// @param count A single element tensor that contains the number of indices
   /// to be processed
   ///
-  /// @return pair of tensors with length of <count> containing L2 evicted
-  /// embedding indices and embeddings, invalid pairs will have
-  /// sentinel value(-1) on <indices>
-  void set_cache(
+  /// @return None if L2 is missing, other wise return pair of tensors with
+  /// length of <count> containing L2 evicted embedding indices and embeddings,
+  /// invalid pairs will have sentinel value(-1) on <indices>
+  folly::Optional<std::pair<at::Tensor, at::Tensor>> set_cache(
       const at::Tensor& indices,
       const at::Tensor& weights,
       const at::Tensor& count);
@@ -220,11 +219,39 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
 
   virtual void flush_or_compact(const int64_t timestep) = 0;
 
+  // waiting for working item queue to be empty, this is called by get_cache()
+  // as embedding read should wait until previous write to be finished
+  void wait_util_filling_work_done();
+
   std::unique_ptr<l2_cache::CacheLibCache> l2_cache_;
   const int64_t unique_id_;
   const int64_t num_shards_;
   const int64_t max_D_;
   std::unique_ptr<folly::CPUThreadPoolExecutor> executor_tp_;
+  std::unique_ptr<std::thread> cache_filling_thread_;
+  std::atomic<bool> stop_{false};
+  // buffer queue that stores all the needed indices/weights/action_count to
+  // fill up cache
+  folly::USPSCQueue<std::tuple<at::Tensor, at::Tensor, at::Tensor>, true>
+      weights_to_fill_queue_;
+
+  // perf stats
+  // --  perf of get() function
+  // cache miss rate(cmr) is avged on cmr per iteration
+  // instead of SUM(cache miss per interval) / SUM(lookups per interval)
+  std::atomic<int64_t> num_cache_misses_{0};
+  std::atomic<int64_t> num_lookups_{0};
+  std::atomic<int64_t> get_total_duration_{0};
+  std::atomic<int64_t> get_cache_lookup_total_duration_{0};
+  std::atomic<int64_t> get_cache_lookup_wait_filling_thread_duration_{0};
+  std::atomic<int64_t> get_weights_fillup_total_duration_{0};
+  std::atomic<int64_t> get_tensor_copy_for_cache_update_{0};
+
+  // -- perf of set() function
+  std::atomic<int64_t> set_tensor_copy_for_cache_update_{0};
+
+  // -- commone path
+  std::atomic<int64_t> total_cache_update_duration_{0};
 }; // class EmbeddingKVDB
 
 } // namespace kv_db

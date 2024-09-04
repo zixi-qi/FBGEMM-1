@@ -146,7 +146,7 @@ class EmbeddingRocksDB : public kv_db::EmbeddingKVDB {
       int64_t cache_size = 0,
       bool use_passed_in_path = false,
       int64_t tbe_unqiue_id = 0,
-      int64_t l2_cache_size_gb = 1)
+      int64_t l2_cache_size_gb = 0)
       : kv_db::EmbeddingKVDB(
             num_shards,
             max_D,
@@ -369,8 +369,7 @@ class EmbeddingRocksDB : public kv_db::EmbeddingKVDB {
                             (2 * (count_ + dbs_.size() - 1) / dbs_.size()) *
                             (sizeof(int64_t) + sizeof(scalar_t) * D));
                         for (auto i = 0; i < count_; ++i) {
-                          // TODO: Check whether this is OK
-                          if (indices_acc[i] == -1) {
+                          if (indices_acc[i] < 0) {
                             continue;
                           }
                           if (kv_db_utils::hash_shard(
@@ -556,7 +555,7 @@ class EmbeddingRocksDB : public kv_db::EmbeddingKVDB {
     return mem_usages;
   }
 
-  std::vector<double> get_io_duration(
+  std::vector<double> get_rocksdb_io_duration(
       const int64_t step,
       const int64_t interval) {
     std::vector<double> ret;
@@ -565,9 +564,9 @@ class EmbeddingRocksDB : public kv_db::EmbeddingKVDB {
       auto read_dur = read_total_duration_.load();
       auto fwd_write_dur = fwd_write_total_duration_.load();
       auto bwd_write_dur = bwd_write_total_duration_.load();
-      ret.push_back(double(read_dur / interval));
-      ret.push_back(double(fwd_write_dur / interval));
-      ret.push_back(double(bwd_write_dur / interval));
+      ret.push_back(double(read_dur) / interval);
+      ret.push_back(double(fwd_write_dur) / interval);
+      ret.push_back(double(bwd_write_dur) / interval);
       read_total_duration_ = 0;
       fwd_write_total_duration_ = 0;
       bwd_write_total_duration_ = 0;

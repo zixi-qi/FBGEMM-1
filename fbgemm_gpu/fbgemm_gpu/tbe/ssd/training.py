@@ -137,7 +137,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         use_passed_in_path: int = True,
         gather_ssd_cache_stats: Optional[bool] = False,
         stats_reporter_config: Optional[TBEStatsReporterConfig] = None,
-        l2_cache_size: int = 1,
+        l2_cache_size: int = 0,
         # Set to True to enable pipeline prefetching
         prefetch_pipeline: bool = False,
         # Set to True to alloc a UVM tensor using malloc+cudaHostRegister.
@@ -355,6 +355,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             else:
                 logging.warning("dist is not initialized, treating as single gpu cases")
                 tbe_unique_id = SSDTableBatchedEmbeddingBags._local_instance_index
+        self.tbe_unique_id = tbe_unique_id
         logging.info(f"tbe_unique_id: {tbe_unique_id}")
         if not ps_hosts:
             logging.info(
@@ -575,7 +576,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         )
         logging.info(
             f"logging stats reporter setup, {self.gather_ssd_cache_stats=}, "
-            f"stats_reporter:{self.stats_reporter if self.stats_reporter else 'none'}, "
+            f"stats_reporter:{self.stats_reporter if self.stats_reporter else 'none'}"
         )
 
         # prefetch launch a series of kernels, we use AsyncSeriesTimer to track the kernel time
@@ -588,6 +589,18 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             -1,
             self.prefetch_parallel_stream_cnt,
             0,
+        )
+        self.l2_num_cache_misses_stats_name: str = (
+            f"l2_cache.perf.get.tbe_id{tbe_unique_id}.num_cache_misses"
+        )
+        self.l2_num_cache_lookups_stats_name: str = (
+            f"l2_cache.perf.get.tbe_id{tbe_unique_id}.num_lookups"
+        )
+        self.l2_cache_free_mem_stats_name: str = (
+            f"l2_cache.mem.tbe_id{tbe_unique_id}.free_mem_bytes"
+        )
+        self.l2_cache_capacity_stats_name: str = (
+            f"l2_cache.mem.tbe_id{tbe_unique_id}.capacity_bytes"
         )
         if self.stats_reporter:
             self.ssd_prefetch_read_timer = AsyncSeriesTimer(
@@ -606,6 +619,12 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     time_unit="us",
                 )
             )
+            # pyre-ignore
+            self.stats_reporter.register_stats(self.l2_num_cache_misses_stats_name)
+            # pyre-ignore
+            self.stats_reporter.register_stats(self.l2_num_cache_lookups_stats_name)
+            self.stats_reporter.register_stats(self.l2_cache_free_mem_stats_name)
+            self.stats_reporter.register_stats(self.l2_cache_capacity_stats_name)
 
     @torch.jit.ignore
     def _report_duration(
@@ -1596,6 +1615,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self._report_ssd_l1_cache_stats()
         self._report_ssd_io_stats()
         self._report_ssd_mem_usage()
+        self._report_l2_cache_perf_stats()
 
     @torch.jit.ignore
     def _report_ssd_l1_cache_stats(self) -> None:
@@ -1646,7 +1666,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         EmbeddingRocksDB will hold stats for total read/write duration in fwd/bwd
         this function fetch the stats from EmbeddingRocksDB and report it with stats_reporter
         """
-        ssd_io_duration = self.ssd_db.get_io_duration(
+        ssd_io_duration = self.ssd_db.get_rocksdb_io_duration(
             self.step, self.stats_reporter.report_interval  # pyre-ignore
         )
 
@@ -1717,6 +1737,104 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             iteration_step=self.step,
             event_name="ssd.mem_usage.block_cache_pinned",
             data_bytes=block_cache_pinned_usage,
+        )
+
+    @torch.jit.ignore
+    def _report_l2_cache_perf_stats(self) -> None:
+        """
+        EmbeddingKVDB will hold stats for L2+SSD performance in fwd/bwd
+        this function fetch the stats from EmbeddingKVDB and report it with stats_reporter
+        """
+        if self.stats_reporter is None:
+            return
+
+        stats_reporter: TBEStatsReporter = self.stats_reporter
+        if not stats_reporter.should_report(self.step):
+            return
+
+        l2_cache_perf_stats = self.ssd_db.get_l2cache_perf(
+            self.step, stats_reporter.report_interval  # pyre-ignore
+        )
+
+        if len(l2_cache_perf_stats) != 11:
+            logging.error("l2 perf stats should have 11 elements")
+            return
+
+        num_cache_misses = l2_cache_perf_stats[0]
+        num_lookups = l2_cache_perf_stats[1]
+        get_total_duration = l2_cache_perf_stats[2]
+        get_cache_lookup_total_duration = l2_cache_perf_stats[3]
+        get_cache_lookup_wait_filling_thread_duration = l2_cache_perf_stats[4]
+        get_weights_fillup_total_duration = l2_cache_perf_stats[5]
+        total_cache_update_duration = l2_cache_perf_stats[6]
+        get_tensor_copy_for_cache_update_duration = l2_cache_perf_stats[7]
+        set_tensor_copy_for_cache_update_duration = l2_cache_perf_stats[8]
+
+        l2_cache_free_bytes = l2_cache_perf_stats[9]
+        l2_cache_capacity = l2_cache_perf_stats[10]
+
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name=self.l2_num_cache_misses_stats_name,
+            data_bytes=num_cache_misses,
+        )
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name=self.l2_num_cache_lookups_stats_name,
+            data_bytes=num_lookups,
+        )
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name=self.l2_cache_capacity_stats_name,
+            data_bytes=l2_cache_capacity,
+        )
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name=self.l2_cache_free_mem_stats_name,
+            data_bytes=l2_cache_free_bytes,
+        )
+
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.get.total_duration_us",
+            duration_ms=get_total_duration,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.get.cache_lookup_duration_us",
+            duration_ms=get_cache_lookup_total_duration,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.get.cache_lookup_wait_filling_thread_duration_us",
+            duration_ms=get_cache_lookup_wait_filling_thread_duration,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.get.weights_fillup_duration_us",
+            duration_ms=get_weights_fillup_total_duration,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.total.cache_update_duration_us",
+            duration_ms=total_cache_update_duration,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.get.tensor_copy_for_cache_update_duration_us",
+            duration_ms=get_tensor_copy_for_cache_update_duration,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="l2_cache.perf.set.tensor_copy_for_cache_update_duration_us",
+            duration_ms=set_tensor_copy_for_cache_update_duration,
+            time_unit="us",
         )
 
     # pyre-ignore

@@ -13,7 +13,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include "fbgemm_gpu/split_embeddings_cache/kv_db_cpp_utils.h"
 
 namespace l2_cache {
 
@@ -37,34 +36,12 @@ class CacheLibCache {
     size_t cacheSizeBytes;
   };
 
-  explicit CacheLibCache(size_t cacheSizeBytes, int64_t num_shards)
-      : cacheConfig_(CacheConfig{.cacheSizeBytes = cacheSizeBytes}),
-        cache_(initializeCacheLib(cacheConfig_)),
-        admin_(createCacheAdmin(*cache_)) {
-    for (int i = 0; i < num_shards; i++) {
-      pool_ids_.push_back(cache_->addPool(
-          fmt::format("shard_{}", i),
-          cache_->getCacheMemoryStats().ramCacheSize / num_shards));
-    }
-  }
+  explicit CacheLibCache(size_t cacheSizeBytes, int64_t num_shards);
 
-  std::unique_ptr<Cache> initializeCacheLib(const CacheConfig& config) {
-    Cache::Config cacheLibConfig;
-    cacheLibConfig.setCacheSize(static_cast<uint64_t>(config.cacheSizeBytes))
-        .setCacheName("TBEL2Cache")
-        .setAccessConfig({25 /* bucket power */, 10 /* lock power */})
-        .setFullCoredump(false)
-        .validate();
-    return std::make_unique<Cache>(cacheLibConfig);
-  }
+  std::unique_ptr<Cache> initializeCacheLib(const CacheConfig& config);
 
   std::unique_ptr<facebook::cachelib::CacheAdmin> createCacheAdmin(
-      Cache& cache) {
-    facebook::cachelib::CacheAdmin::Config adminConfig;
-    adminConfig.oncall = "mvai";
-    return std::make_unique<facebook::cachelib::CacheAdmin>(
-        cache, std::move(adminConfig));
-  }
+      Cache& cache);
 
   /// Find the stored embeddings from a given embedding indices, aka key
   ///
@@ -77,24 +54,14 @@ class CacheLibCache {
   /// @note that this is not thread safe, caller needs to make sure the data is
   /// fully processed before doing cache insertion, otherwise the returned space
   /// might be overwritten if cache is full
-  std::optional<void*> get(int64_t key) {
-    auto key_str = folly::StringPiece(
-        reinterpret_cast<const char*>(&key), sizeof(int64_t));
-    auto item = cache_->find(key_str);
-    if (!item) {
-      return std::nullopt;
-    }
-    return const_cast<void*>(item->getMemory());
-  }
+  std::optional<void*> get(int64_t key);
 
   /// Cachelib wrapper specific hash function
   ///
   /// @param key embedding index to get hashed
   ///
   /// @return an hashed value ranges from [0, num_pools)
-  size_t get_shard_id(int64_t key) {
-    return kv_db_utils::hash_shard(key, pool_ids_.size());
-  }
+  size_t get_shard_id(int64_t key);
 
   /// get pool id given an embedding index
   ///
@@ -102,9 +69,7 @@ class CacheLibCache {
   ///
   /// @return a pool id associated with the given key, this is to build a
   /// deterministic mapping from a embedding index to a specific pool id
-  facebook::cachelib::PoolId get_pool_id(int64_t key) {
-    return pool_ids_[get_shard_id(key)];
-  }
+  facebook::cachelib::PoolId get_pool_id(int64_t key);
 
   /// Add an embedding index and embeddings into cachelib
   ///
@@ -118,25 +83,46 @@ class CacheLibCache {
   /// bulk read and bluk write sequentially
   ///
   /// @note cache_->allocation will trigger eviction callback func
-  bool put(int64_t key, const at::Tensor& data) {
-    auto key_str = folly::StringPiece(
-        reinterpret_cast<const char*>(&key), sizeof(int64_t));
-    auto item = cache_->allocate(get_pool_id(key), key_str, data.nbytes());
-    if (!item) {
-      XLOG(ERR) << fmt::format(
-          "Failed to allocate item {} in cache, skip", key);
-      return false;
-    }
-    std::memcpy(item->getMemory(), data.data_ptr(), data.nbytes());
-    cache_->insertOrReplace(std::move(item));
-    return true;
-  }
+  bool put(int64_t key, const at::Tensor& data);
+
+  /// instantiate eviction related indices and weights tensors(size of <count>)
+  /// for L2 eviction using the same dtype and device from <indices> and
+  /// <weights> , managed on the caller side
+  ///
+  /// @param indices The 1D embedding index tensor, should skip on negative
+  /// value
+  /// @param weights The 2D tensor that each row(embeddings) is paired up with
+  /// relative element in <indices>
+  /// @param count A single element tensor that contains the number of indices
+  /// to be processed
+  ///
+  /// @return None
+  void init_tensor_for_l2_eviction(
+      const at::Tensor& indices,
+      const at::Tensor& weights,
+      const at::Tensor& count);
+
+  /// reset slot pointer that points to the next available slot in the eviction
+  /// tensors
+  void reset_eviction_states();
+
+  /// get the filled indices and weights tensors from L2 eviction, could be all
+  /// invalid if no eviction happened
+  folly::Optional<std::pair<at::Tensor, at::Tensor>>
+  get_evicted_indices_and_weights();
+
+  /// get L2 cache utilization stats
+  std::vector<int64_t> get_cache_usage();
 
  private:
-  const CacheConfig cacheConfig_;
+  const CacheConfig cache_config_;
   std::unique_ptr<Cache> cache_;
   std::vector<facebook::cachelib::PoolId> pool_ids_;
   std::unique_ptr<facebook::cachelib::CacheAdmin> admin_;
+
+  std::shared_ptr<at::Tensor> evicted_indices_ptr_{nullptr};
+  std::shared_ptr<at::Tensor> evicted_weights_ptr_{nullptr};
+  std::atomic<int64_t> eviction_row_id{0};
 };
 
 } // namespace l2_cache

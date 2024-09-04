@@ -239,7 +239,7 @@ class EmbeddingRocksDBWrapper : public torch::jit::CustomClassHolder {
       int64_t cache_size = 0,
       bool use_passed_in_path = false,
       int64_t tbe_unique_id = 0,
-      int64_t l2_cache_size_gb = 1)
+      int64_t l2_cache_size_gb = 0)
       : impl_(std::make_shared<ssd::EmbeddingRocksDB>(
             path,
             num_shards,
@@ -286,10 +286,16 @@ class EmbeddingRocksDBWrapper : public torch::jit::CustomClassHolder {
     return impl_->get_mem_usage();
   }
 
-  std::vector<double> get_io_duration(
+  std::vector<double> get_rocksdb_io_duration(
       const int64_t step,
       const int64_t interval) {
-    return impl_->get_io_duration(step, interval);
+    return impl_->get_rocksdb_io_duration(step, interval);
+  }
+
+  std::vector<double> get_l2cache_perf(
+      const int64_t step,
+      const int64_t interval) {
+    return impl_->get_l2cache_perf(step, interval);
   }
 
   void compact() {
@@ -348,7 +354,7 @@ static auto embedding_rocks_db_wrapper =
                 torch::arg("cache_size"),
                 torch::arg("use_passed_in_path") = true,
                 torch::arg("tbe_unique_id") = 0,
-                torch::arg("l2_cache_size_gb") = 1,
+                torch::arg("l2_cache_size_gb") = 0,
             })
         .def(
             "set_cuda",
@@ -365,7 +371,10 @@ static auto embedding_rocks_db_wrapper =
         .def("compact", &EmbeddingRocksDBWrapper::compact)
         .def("flush", &EmbeddingRocksDBWrapper::flush)
         .def("get_mem_usage", &EmbeddingRocksDBWrapper::get_mem_usage)
-        .def("get_io_duration", &EmbeddingRocksDBWrapper::get_io_duration)
+        .def(
+            "get_rocksdb_io_duration",
+            &EmbeddingRocksDBWrapper::get_rocksdb_io_duration)
+        .def("get_l2cache_perf", &EmbeddingRocksDBWrapper::get_l2cache_perf)
         .def("set", &EmbeddingRocksDBWrapper::set)
         .def("get", &EmbeddingRocksDBWrapper::get);
 
