@@ -687,6 +687,36 @@ def _kernel_matmul_fp8_row_imprecise_acc(
             num_stages=3,
             num_warps=8,
         ),
+        Config(
+            {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "SPLIT_K": 1},
+            num_stages=3,
+            num_warps=8,
+        ),
+        Config(
+            {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 128, "SPLIT_K": 1},
+            num_stages=4,
+            num_warps=4,
+        ),
+        Config(
+            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "SPLIT_K": 1},
+            num_stages=4,
+            num_warps=4,
+        ),
+        Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "SPLIT_K": 1},
+            num_stages=4,
+            num_warps=4,
+        ),
+        Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "SPLIT_K": 1},
+            num_stages=4,
+            num_warps=4,
+        ),
+        Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "SPLIT_K": 1},
+            num_stages=4,
+            num_warps=4,
+        ),
     ],
     key=[
         "m_key",
@@ -720,6 +750,7 @@ def _kernel_matmul_fp8_row_tma_persistent(
     stride_cm,
     stride_cn,
     dot_out_dtype: tl.constexpr,
+    c_dtype: tl.constexpr,
     allow_tf32: tl.constexpr,
     fp8_fast_accum: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -839,8 +870,7 @@ def _kernel_matmul_fp8_row_tma_persistent(
                 )
                 acc += bias[None, :]
 
-            acc = acc.to(C_ptr.dtype.element_ty)
-
+            acc = acc.to(c_dtype)
             tl._experimental_descriptor_store(C_ptr, acc, [offs_am, offs_bn])
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=dot_out_dtype)
 
@@ -972,8 +1002,8 @@ def matmul_fp8_row(
     # Reinterpret inputs into proper triton fp8 dtype.
     a_tl = convert_fp8_type(a, tl_dtype)
     b_tl = convert_fp8_type(b, tl_dtype)
-    M, N, K, m_key, n_key, k_key, c, dot_out_dtype_triton, device = prep_matmul(
-        a_tl, b_tl, dot_out_dtype
+    M, N, K, m_key, n_key, k_key, c, c_dtype_triton, dot_out_dtype_triton, device = (
+        prep_matmul(a_tl, b_tl, dot_out_dtype)
     )
 
     output_shape = a_shape[:-1] + (N,)
@@ -1086,7 +1116,6 @@ def matmul_fp8_row(
             desc_a,
             desc_b,
             desc_c,
-            # c,
             M,
             N,
             K,
@@ -1103,6 +1132,7 @@ def matmul_fp8_row(
             c.stride(0),
             c.stride(1),
             dot_out_dtype=dot_out_dtype_triton,
+            c_dtype=c_dtype_triton,
             allow_tf32=allow_tf32,
             fp8_fast_accum=fp8_fast_accum,
             GROUP_M=8,
@@ -1637,7 +1667,7 @@ def matmul_fp8_block(
     a_tl = convert_fp8_type(a, tl_dtype)
     b_tl = convert_fp8_type(b, tl_dtype)
 
-    M, N, K, m_key, n_key, k_key, c, dot_out_dtype_triton, device = prep_matmul(
+    M, N, K, m_key, n_key, k_key, c, _, dot_out_dtype_triton, device = prep_matmul(
         a_tl, b_tl, dot_out_dtype
     )
 
@@ -1765,7 +1795,7 @@ def get_matmul_tune(M: int, N: int, K: int) -> Tuple[int, int, int]:
 
 def prep_matmul(
     a: TensorWrapper, b: TensorWrapper, dot_out_dtype: Optional[torch.dtype]
-) -> Tuple[int, int, int, int, int, int, torch.Tensor, str, torch.device]:
+) -> Tuple[int, int, int, int, int, int, torch.Tensor, str, str, torch.device]:
     """
     Shared bookkeeping for a @ b.T matmul.
 
@@ -1808,6 +1838,7 @@ def prep_matmul(
         tl.float8e4b8,
     ]
     c_dtype = torch.bfloat16
+    c_dtype_triton = tl.bfloat16
 
     c = torch.empty((M, N), device=device, dtype=c_dtype)
     if dot_out_dtype is None:
@@ -1823,7 +1854,7 @@ def prep_matmul(
         else:
             dot_out_dtype_triton = tl.int32
 
-    return M, N, K, m_key, n_key, k_key, c, dot_out_dtype_triton, device
+    return M, N, K, m_key, n_key, k_key, c, c_dtype_triton, dot_out_dtype_triton, device
 
 
 @triton.autotune(
