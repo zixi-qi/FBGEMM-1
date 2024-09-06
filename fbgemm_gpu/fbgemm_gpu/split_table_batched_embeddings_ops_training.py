@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import torch  # usort:skip
 from torch import nn, Tensor  # usort:skip
 
+# @manual=//deeplearning/fbgemm/fbgemm_gpu/codegen:split_embedding_codegen_lookup_invokers
 import fbgemm_gpu.split_embedding_codegen_lookup_invokers as invokers
 
 from fbgemm_gpu.config import FeatureGate, FeatureGateName
@@ -230,6 +231,7 @@ def apply_split_helper(
     make_dev_param: bool = False,
     dev_reshape: Optional[Tuple[int, ...]] = None,
     uvm_tensors_log: Optional[List[str]] = None,
+    uvm_host_mapped: bool = False,
 ) -> None:
     set_attr_fn(f"{prefix}_physical_placements", split.placements)
     set_attr_fn(f"{prefix}_physical_offsets", split.offsets)
@@ -313,11 +315,12 @@ def apply_split_helper(
                 f"{prefix}_uvm",
                 torch.zeros(
                     split.uvm_size,
-                    out=torch.ops.fbgemm.new_managed_tensor(
+                    out=torch.ops.fbgemm.new_unified_tensor(
                         # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]`
                         #  for 3rd param but got `Type[Type[torch._dtype]]`.
                         torch.zeros(1, device=current_device, dtype=dtype),
                         [split.uvm_size],
+                        is_host_mapped=uvm_host_mapped,
                     ),
                 ),
             )
@@ -540,6 +543,9 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         multipass_prefetch_config: Optional[MultiPassPrefetchConfig] = None,
         # Global weight decay params
         global_weight_decay: Optional[GlobalWeightDecayDefinition] = None,
+        # Set to True to alloc a UVM tensor using malloc+cudaHostRegister.
+        # Set to False to use cudaMallocManaged
+        uvm_host_mapped: bool = False,
     ) -> None:
         super(SplitTableBatchedEmbeddingBagsCodegen, self).__init__()
         self.uuid = str(uuid.uuid4())
@@ -746,6 +752,8 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             loc == locations[0] for loc in locations
         )
 
+        self.uvm_host_mapped = uvm_host_mapped
+
         weight_split = construct_split_state(
             embedding_specs,
             rowwise=False,
@@ -763,6 +771,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             enforce_hbm=enforce_hbm,
             make_dev_param=optimizer == OptimType.NONE,
             dev_reshape=(-1, self.max_D) if optimizer == OptimType.NONE else None,
+            uvm_host_mapped=self.uvm_host_mapped,
         )
 
         assert optimizer not in (
@@ -936,6 +945,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     #  but got `Type[torch.float32]`.
                     dtype=momentum1_dtype,
                     enforce_hbm=enforce_hbm,
+                    uvm_host_mapped=self.uvm_host_mapped,
                 )
             if optimizer in (
                 OptimType.ADAM,
@@ -972,6 +982,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     # pyre-fixme[6]: Expected `Type[Type[torch._dtype]]` for 3rd param
                     #  but got `Type[torch.float32]`.
                     dtype=momentum2_dtype,
+                    uvm_host_mapped=self.uvm_host_mapped,
                 )
             else:
                 # NOTE: make TorchScript work!
@@ -990,6 +1001,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     # pyre-fixme[6]: Expected `Type[Type[torch._dtype]]` for 3rd param
                     #  but got `Type[torch.float32]`.
                     dtype=torch.float32,
+                    uvm_host_mapped=self.uvm_host_mapped,
                 )
                 self._apply_split(
                     construct_split_state(
@@ -1001,6 +1013,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     # pyre-fixme[6]: Expected `Type[Type[torch._dtype]]` for 3rd param
                     #  but got `Type[torch.float32]`.
                     dtype=torch.float32,
+                    uvm_host_mapped=self.uvm_host_mapped,
                 )
                 self.register_buffer(
                     "max_counter", torch.tensor([1], dtype=torch.float32)
@@ -1019,6 +1032,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     # pyre-fixme[6]: Expected `Type[Type[torch._dtype]]` for 3rd param
                     #  but got `Type[torch.float32]`.
                     dtype=torch.float32,
+                    uvm_host_mapped=self.uvm_host_mapped,
                 )
                 self._register_nonpersistent_buffers("row_counter")
                 self.register_buffer(
@@ -2281,6 +2295,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         enforce_hbm: bool = False,
         make_dev_param: bool = False,
         dev_reshape: Optional[Tuple[int, ...]] = None,
+        uvm_host_mapped: bool = False,
     ) -> None:
         apply_split_helper(
             self.register_buffer,
@@ -2295,6 +2310,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             make_dev_param,
             dev_reshape,
             self._uvm_tensors_log,
+            uvm_host_mapped=uvm_host_mapped,
         )
 
     def _apply_cache_state(
