@@ -50,7 +50,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training_common import (
     is_torchdynamo_compiling,
 )
 
-from fbgemm_gpu.utils.loader import load_torch_module
+from fbgemm_gpu.utils.loader import load_torch_module, load_torch_module_bc
 
 try:
     load_torch_module(
@@ -58,9 +58,9 @@ try:
         "//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops_cuda_training",
         "//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops_hip_training",
     )
-
-    torch.ops.load_library(
-        "//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops_cpu_training"
+    load_torch_module_bc(
+        "//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops_training_cpu",
+        "//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops_cpu_training",
     )
 except Exception:
     pass
@@ -388,7 +388,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         step_ema: float = 10000,  # used by ENSEMBLE_ROWWISE_ADAGRAD
         step_swap: float = 10000,  # used by ENSEMBLE_ROWWISE_ADAGRAD
         step_start: float = 0,  # used by ENSEMBLE_ROWWISE_ADAGRAD
-        step_mode: StepMode = StepMode.USE_COUNTER,  # used by ENSEMBLE_ROWWISE_ADAGRAD
+        step_mode: StepMode = StepMode.USE_ITER,  # used by ENSEMBLE_ROWWISE_ADAGRAD
         counter_based_regularization: Optional[
             CounterBasedRegularizationDefinition
         ] = None,  # used by Rowwise Adagrad
@@ -855,7 +855,9 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             else:
                 # NOTE: make TorchScript work!
                 self._register_nonpersistent_buffers("momentum2")
-            if self._used_rowwise_adagrad_with_counter:
+            if self._used_rowwise_adagrad_with_counter or (
+                optimizer == OptimType.ENSEMBLE_ROWWISE_ADAGRAD
+            ):
                 self._apply_split(
                     construct_split_state(
                         embedding_specs,
@@ -903,24 +905,6 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     uvm_host_mapped=self.uvm_host_mapped,
                 )
                 self._register_nonpersistent_buffers("row_counter")
-                self.register_buffer(
-                    "max_counter",
-                    torch.ones(1, dtype=torch.float32, device=self.current_device),
-                    persistent=False,
-                )
-            elif optimizer == OptimType.ENSEMBLE_ROWWISE_ADAGRAD:
-                self._register_nonpersistent_buffers("prev_iter")
-                self._apply_split(
-                    construct_split_state(
-                        embedding_specs,
-                        rowwise=True,
-                        cacheable=False,
-                    ),
-                    prefix="row_counter",
-                    # pyre-fixme[6]: Expected `Type[Type[torch._dtype]]` for 3rd param
-                    #  but got `Type[torch.float32]`.
-                    dtype=torch.float32,
-                )
                 self.register_buffer(
                     "max_counter",
                     torch.ones(1, dtype=torch.float32, device=self.current_device),
@@ -1497,10 +1481,10 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     self.optimizer_args,
                     momentum1,
                     momentum2,
+                    prev_iter,
                     row_counter,
                     iter=int(self.iter.item()),
                     apply_global_weight_decay=False,
-                    prev_iter_dev=self.prev_iter_dev,
                     gwd_lower_bound=0.0,
                 ),
             )
@@ -1966,7 +1950,8 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 {
                     "sum": states[0],
                     "exp_avg": states[1],
-                    "row_counter": states[2],
+                    "prev_iter": states[2],
+                    "row_counter": states[3],
                 }
                 for states in split_optimizer_states
             ]
@@ -2063,6 +2048,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         if (
             self._used_rowwise_adagrad_with_counter
             or self._used_rowwise_adagrad_with_global_weight_decay
+            or self.optimizer == OptimType.ENSEMBLE_ROWWISE_ADAGRAD
         ):
             states.append(
                 get_optimizer_states(
@@ -2300,6 +2286,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         )
 
         self.total_cache_hash_size = cache_state.total_cache_hash_size
+        # 8x of # tables, trivial size
         self.register_buffer(
             "cache_hash_size_cumsum",
             torch.tensor(
@@ -2308,6 +2295,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 dtype=torch.int64,
             ),
         )
+        # 4x total embedding hash size with uvm cache
         self.register_buffer(
             "cache_index_table_map",
             torch.tensor(
@@ -2316,12 +2304,14 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 dtype=torch.int32,
             ),
         )
+        # 8x of total cache slots (embedding hash size * clf)
         self.register_buffer(
             "lxu_cache_state",
             torch.zeros(
                 cache_sets, DEFAULT_ASSOC, device=self.current_device, dtype=torch.int64
             ).fill_(-1),
         )
+        # Cache itself, not auxiliary size
         self.register_buffer(
             "lxu_cache_weights",
             torch.zeros(
@@ -2331,6 +2321,8 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 dtype=dtype,
             ),
         )
+        # LRU: 8x of total cache slots (embedding hash size * clf)
+        # LFU: 8x of total embedding hash size with uvm cache
         self.register_buffer(
             "lxu_state",
             torch.zeros(
