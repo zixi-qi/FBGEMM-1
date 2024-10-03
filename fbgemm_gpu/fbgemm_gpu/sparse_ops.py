@@ -20,20 +20,18 @@ try:
     from fbgemm_gpu import open_source  # noqa: F401
 except Exception:
     load_torch_module("//deeplearning/fbgemm/fbgemm_gpu:merge_pooled_embeddings")
+    load_torch_module("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
 
     if torch.version.hip:
-        torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_hip")
         torch.ops.load_library(
             "//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops_hip"
         )
 
     else:
-        torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
         torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu/codegen:embedding_ops")
 
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:input_combine")
 
-    torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
     torch.ops.load_library(
         "//deeplearning/fbgemm/fbgemm_gpu:merge_pooled_embeddings_cpu"
     )
@@ -1075,11 +1073,11 @@ def _setup() -> None:
         )
         impl_abstract("fbgemm::bounds_check_indices", bounds_check_indices_abstract)
         impl_abstract(
-            "fbgemm::group_index_select_dim0_forward_impl",
+            "fbgemm::group_index_select_dim0_gpu_impl",
             group_index_select_dim0_gpu_impl_abstract,
         )
         impl_abstract(
-            "fbgemm::group_index_select_dim0_backward_impl",
+            "fbgemm::group_index_select_dim0_gpu_backward",
             group_index_select_dim0_gpu_backward_abstract,
         )
         impl_abstract(
