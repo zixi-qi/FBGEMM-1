@@ -448,7 +448,7 @@ at::Tensor handle_transposition(
           BIAS_DTYPE>(
           WQ.transpose(1, 2), XQ.transpose(1, 2), w_scale, x_scale, bias, out);
     }
-    return out_.transpose(1, 2);
+    return out_.transpose(1, 2).contiguous();
   }
 }
 
@@ -599,9 +599,9 @@ at::Tensor f8f8bf16_rowwise_batched(
     at::Tensor WQ, // FP8
     at::Tensor x_scale, // FP32
     at::Tensor w_scale, // FP32
-    std::optional<at::Tensor> bias = c10::nullopt,
+    std::optional<at::Tensor> bias = std::nullopt,
     bool use_fast_accum = true,
-    std::optional<at::Tensor> output = c10::nullopt) {
+    std::optional<at::Tensor> output = std::nullopt) {
   // Check datatypes.
   TORCH_CHECK(
       x_scale.dtype() == at::kFloat && w_scale.dtype() == at::kFloat,
@@ -720,9 +720,9 @@ at::Tensor f8f8bf16_rowwise_batched(
     at::Tensor WQ, // FP8
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> bias = c10::nullopt,
+    std::optional<at::Tensor> bias = std::nullopt,
     bool use_fast_accum = true,
-    std::optional<at::Tensor> output = c10::nullopt) {
+    std::optional<at::Tensor> output = std::nullopt) {
   throw std::runtime_error(
       "CUDA version is older than 12.0"); // requires CUDA>=12
 }
