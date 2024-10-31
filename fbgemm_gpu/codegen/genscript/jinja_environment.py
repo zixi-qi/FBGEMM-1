@@ -289,20 +289,13 @@ def is_valid_forward_config(
 
 
 def has_experimental_support(
-    dense: bool, nobag: bool, vbe: bool, is_index_select: bool, is_rocm: bool, ssd: bool
+    dense: bool, nobag: bool, vbe: bool, is_index_select: bool, ssd: bool
 ) -> bool:
     """
     Check if the given combination of configs has TBE v2 support
     - TBE v2 does not support dense, nobag, vbe, is_index_select, is_rocm, and ssd
     """
-    return (
-        not dense
-        and not nobag
-        and not vbe
-        and not is_index_select
-        and not is_rocm
-        and not ssd
-    )
+    return not dense and not nobag and not vbe and not is_index_select and not ssd
 
 
 def is_valid_gwd_config(
