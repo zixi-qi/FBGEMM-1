@@ -103,7 +103,7 @@ enum SSDTensor {
       {%- if is_gwd %}
       hash_size_cumsum,
       prev_iter_dev_,
-      learning_rate,
+      learning_rate_tensor,
       weight_decay,
       iter,
       gwd_lower_bound,
@@ -461,7 +461,7 @@ Tensor {{ fwd_mdesc }}_embedding{{ ndesc }}_codegen_forward{{ desc_suffix }}_cud
     {%- if is_gwd %}
     const Tensor& hash_size_cumsum,
     const Tensor& prev_iter_dev,
-    const double learning_rate,
+    const Tensor& learning_rate_tensor,
     const double weight_decay,
     const int64_t iter,
     const double gwd_lower_bound,
@@ -1048,7 +1048,7 @@ Tensor {{ bwd_mdesc }}_embedding_codegen_lookup_{{ optimizer }}_function(
     const double max_gradient,
     const bool stochastic_rounding,
     {%- endif %}
-    {{ args.split_function_args | join(", ") }},
+    {{ args.split_function_args_v1 }},
     {%- endif %}
     const int64_t output_dtype = static_cast<int64_t>(SparseType::FP32),
     const std::optional<Tensor>& B_offsets = std::nullopt,
@@ -1080,6 +1080,14 @@ Tensor {{ bwd_mdesc }}_embedding_codegen_lookup_{{ optimizer }}_function(
   // TODO: refactor into macro
   {%- if has_gpu_support %}
 
+    {%- if "learning_rate_tensor" in args.split_function_arg_names %}
+    // `learning rate` is changed to tensor to prevent recompilation. 
+    // This interface (V1) still accepts learning rate as float for backward compatibility, 
+    // We convert learning rate to tensor here to work with the backend
+    // The unified PT2 interface already accepts learning rate as tensor.
+    const auto learning_rate_tensor = at::tensor({learning_rate}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+    {%- endif %}
+
     {%- if not dense %}
     // Load the config value from JK once
     static auto is_tbev2_enabled = config::is_feature_enabled(config::FeatureGateName::TBE_V2);
@@ -1088,11 +1096,16 @@ Tensor {{ bwd_mdesc }}_embedding_codegen_lookup_{{ optimizer }}_function(
     const auto is_experimental = is_tbev2_enabled || is_experimental_tbe;
     {%- endif %}
 
-    {%- if not ssd %}
+    {%- if ssd %}
+    TORCH_CHECK(
+        ssd_tensors.value().size() == {{ ssd_tensors | length }},
+        "SSD TBE expects {{ ssd_tensors | length }} in ssd_tensors");
+    {%- endif %}
+
     {%- if has_vbe_support %}
     // has vbe support
     if (B_offsets.has_value()) {
-      {%- if has_global_weight_decay_support %}
+      {%- if has_global_weight_decay_support and not ssd %}
         // vbe and has gwd support
         if (apply_global_weight_decay && weight_decay > 0) {
           {{ call_autograd(nobag=False, vbe=True, is_gwd=True) }}
@@ -1103,20 +1116,13 @@ Tensor {{ bwd_mdesc }}_embedding_codegen_lookup_{{ optimizer }}_function(
     }
     {%- endif %} {#-/* if has_vbe_support */ #}
 
-    {%- if has_global_weight_decay_support %}
+    {%- if has_global_weight_decay_support and not ssd %}
     // has gwd support
     if (apply_global_weight_decay && weight_decay > 0) {
       // not vbe and gwd
       {{ call_autograd(nobag=False, vbe=False, is_gwd=True) }}
     }
     {%- endif %} {#-/* if has_global_weight_decay_support */ #}
-    {%- endif %} {#-/* if not ssd */#}
-
-    {%- if ssd %}
-    TORCH_CHECK(
-        ssd_tensors.value().size() == {{ ssd_tensors | length }},
-        "SSD TBE expects {{ ssd_tensors | length }} in ssd_tensors");
-    {%- endif %}
 
     if (static_cast<PoolingMode>(pooling_mode) == PoolingMode::NONE) {
       // no bag
@@ -1162,7 +1168,7 @@ TORCH_LIBRARY_FRAGMENT({{ lib_name }}, m) {
           "    float max_gradient, "
           "    bool stochastic_rounding, "
           {%- endif %}
-          "    {{ args.split_function_schemas | join(", ") }}, "
+          "    {{ args.split_function_schemas_v1 }}, "
           "    int output_dtype=0, "
           "    Tensor? B_offsets=None, "
           "    Tensor? vbe_output_offsets_feature_rank=None, "
