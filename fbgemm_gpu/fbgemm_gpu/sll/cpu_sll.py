@@ -165,3 +165,62 @@ def cpu_jagged_jagged_bmm(
         return torch.ops.fbgemm.jagged_jagged_bmm(x, y, x_offsets, N)
     else:
         return JaggedJaggedBmm.apply(x, y, x_offsets, N)
+
+
+def cpu_dense_jagged_cat_jagged_out(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_offsets: torch.Tensor,
+    max_seq_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert a.size(0) == b_offsets.size(0) - 1
+    c = torch.empty(b.size(0) + a.size(0), dtype=a.dtype, device=a.device)
+    c_offsets = b_offsets + torch.arange(
+        b_offsets.size(0), dtype=torch.int64, device=a.device
+    )
+    lengths = torch.diff(b_offsets)
+    c = torch.cat(
+        [
+            (
+                torch.cat((a[i : i + 1], b[b_offsets[i] : b_offsets[i + 1]]), dim=-1)
+                if lengths[i] > 0
+                else a[i : i + 1]
+            )
+            for i in range(a.size(0))
+        ],
+        dim=-1,
+    )
+    return c, c_offsets
+
+
+def cpu_jagged_self_substraction_jagged_out(
+    jagged_A: torch.Tensor,
+    offsets_a: torch.Tensor,
+    offsets_b: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    jagged_B = torch.empty(
+        (int(offsets_b[-1].item())), device=jagged_A.device, dtype=jagged_A.dtype
+    )
+    for i in range(len(offsets_a) - 1):
+        if offsets_a[i + 1] - offsets_a[i] == 1:
+            continue
+
+        a = jagged_A[offsets_a[i] : offsets_a[i + 1]]
+        jagged_B[offsets_b[i] : offsets_b[i + 1]] = (
+            a[:-1].unsqueeze(1) - a[1:].unsqueeze(0)
+        ).flatten()
+    return jagged_B
+
+
+def meta_jagged_self_substraction_jagged_out(
+    jagged_A: torch.Tensor,
+    offsets_a: torch.Tensor,
+    offsets_b: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    return torch.empty(
+        [torch.library.get_ctx().new_dynamic_size()],
+        dtype=jagged_A.dtype,
+        device=jagged_A.device,
+    )

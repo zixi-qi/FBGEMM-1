@@ -10,11 +10,19 @@
 import torch
 
 from fbgemm_gpu.sll.cpu_sll import (  # noqa F401
+    cpu_dense_jagged_cat_jagged_out,
     cpu_jagged_dense_bmm,
     cpu_jagged_jagged_bmm,
+    cpu_jagged_self_substraction_jagged_out,
+    meta_jagged_self_substraction_jagged_out,
 )
 
-from fbgemm_gpu.sll.triton_sll import jagged_dense_bmm, jagged_jagged_bmm  # noqa F401
+from fbgemm_gpu.sll.triton_sll import (  # noqa F401
+    dense_jagged_cat_jagged_out,
+    jagged_dense_bmm,
+    jagged_jagged_bmm,
+    triton_jagged_self_substraction_jagged_out,
+)
 
 
 def op_registeration(
@@ -42,7 +50,10 @@ def op_registeration(
     """
     full_op_name = "fbgemm::" + op_name
     if not torch._C._dispatch_has_kernel_for_dispatch_key(full_op_name, dispatch_key):
-        lib.impl(op_name, fn, dispatch_key)
+        if dispatch_key == "Meta":
+            lib._register_fake(op_name, fn)
+        else:
+            lib.impl(op_name, fn, dispatch_key)
 
 
 lib = torch.library.Library("fbgemm", "FRAGMENT")
@@ -73,6 +84,28 @@ if "fbgemm::sll_jagged_jagged_bmm" not in torch.library._defs:
         """
     )
 
+if "fbgemm::sll_dense_jagged_cat_jagged_out" not in torch.library._defs:
+    lib.define(
+        """sll_dense_jagged_cat_jagged_out(
+            Tensor a,
+            Tensor b,
+            Tensor a_offsets,
+            int max_seq_len
+        ) -> (Tensor, Tensor)
+        """
+    )
+
+if "fbgemm::sll_jagged_self_substraction_jagged_out" not in torch.library._defs:
+    lib.define(
+        """sll_jagged_self_substraction_jagged_out(
+            Tensor a,
+            Tensor offsets_a,
+            Tensor offsets_b,
+            int max_seq_len
+        ) -> Tensor
+        """
+    )
+
 op_registeration(lib, "sll_jagged_dense_bmm", jagged_dense_bmm, "CUDA")
 op_registeration(lib, "sll_jagged_dense_bmm", jagged_dense_bmm, "AutogradCUDA")
 op_registeration(lib, "sll_jagged_dense_bmm", cpu_jagged_dense_bmm, "CPU")
@@ -81,3 +114,27 @@ op_registeration(lib, "sll_jagged_jagged_bmm", jagged_jagged_bmm, "CUDA")
 op_registeration(lib, "sll_jagged_jagged_bmm", jagged_jagged_bmm, "AutogradCUDA")
 op_registeration(lib, "sll_jagged_jagged_bmm", cpu_jagged_jagged_bmm, "CPU")
 op_registeration(lib, "sll_jagged_jagged_bmm", cpu_jagged_jagged_bmm, "AutogradCPU")
+op_registeration(
+    lib, "sll_dense_jagged_cat_jagged_out", dense_jagged_cat_jagged_out, "CUDA"
+)
+op_registeration(
+    lib, "sll_dense_jagged_cat_jagged_out", cpu_dense_jagged_cat_jagged_out, "CPU"
+)
+op_registeration(
+    lib,
+    "sll_jagged_self_substraction_jagged_out",
+    triton_jagged_self_substraction_jagged_out,
+    "CUDA",
+)
+op_registeration(
+    lib,
+    "sll_jagged_self_substraction_jagged_out",
+    cpu_jagged_self_substraction_jagged_out,
+    "CPU",
+)
+op_registeration(
+    lib,
+    "sll_jagged_self_substraction_jagged_out",
+    meta_jagged_self_substraction_jagged_out,
+    "Meta",
+)
