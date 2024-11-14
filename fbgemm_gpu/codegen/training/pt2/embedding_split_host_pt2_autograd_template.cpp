@@ -613,8 +613,8 @@ class {{ autograd_func }} :
         << "T=" << T << ","
         << "avg_D=" << ({{ "total_D / T" if not nobag else "D" }}) << ","
         << "max_D=" << {{ "max_D" if not nobag else "D" }} << ","
-        << "num_indices=" << indices.numel() << ","
-        << "avg_pooling_fac=" << (static_cast<float>(indices.numel()) / T / max_B_)
+        << "num_indices=" << indices.sym_numel() << ","
+        << "avg_pooling_fac=" << (static_cast<c10::SymFloat>(indices.sym_numel()) / T / max_B_)
         << "]";
       op_annotation = ss.str();
       record_trace = profiler::record_function_enter_new(
@@ -633,8 +633,8 @@ class {{ autograd_func }} :
     int32_t info_B_num_bits = DEFAULT_INFO_B_NUM_BITS;
     uint32_t info_B_mask = (1u << info_B_num_bits) - 1;
     if (max_B_.is_symbolic()) {
-      int32_t info_B_num_bits = 22;
-      uint32_t info_B_mask = (1u << info_B_num_bits) - 1;
+      // int32_t info_B_num_bits = 22;
+      // uint32_t info_B_mask = (1u << info_B_num_bits) - 1;
 
       // TODO(ivankobzarev): Guarding Dynamo that T and B fits in constanted number of bits.
       // TORCH_CHECK(max_B_ < 1u << info_B_num_bits)
@@ -848,8 +848,8 @@ static torch::autograd::variable_list backward(
     auto max_gradient = ctx->saved_data["max_gradient"].toDouble();
     auto stochastic_rounding = ctx->saved_data["stochastic_rounding"].toBool();
     {%- endif %} {#-/* if optimizer != "none" */#}
-    const int32_t info_B_num_bits = ctx->saved_data["info_B_num_bits"].toInt();
-    const int64_t info_B_mask_int64 = ctx->saved_data["info_B_mask"].toInt();
+    [[maybe_unused]] const int32_t info_B_num_bits = ctx->saved_data["info_B_num_bits"].toInt();
+    [[maybe_unused]] const int64_t info_B_mask_int64 = ctx->saved_data["info_B_mask"].toInt();
     const auto use_uniq_cache_locations_bwd = ctx->saved_data["use_uniq_cache_locations_bwd"].toBool();
     const auto use_homogeneous_placements = ctx->saved_data["use_homogeneous_placements"].toBool();
     {%- if is_gwd %}
