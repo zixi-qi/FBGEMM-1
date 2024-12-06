@@ -432,6 +432,185 @@ def jagged_dense_elementwise_mul_jagged_out_kernel(
         c_ptrs += BLOCK_N
 
 
+@triton.jit
+def array_jagged_bmm_kernel(
+    a_ptr,  # 1D array
+    b_ptr,  # jagged matrix
+    c_ptr,  # output, jagged matrix
+    a_offsets_ptr,
+    b_offsets_ptr,
+    c_offsets_ptr,
+    D,  # emb dimension
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    transpose,  # one if a is transpose, otherwise zero
+    max_seq_len,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    allow_tf32: tl.constexpr,
+):
+
+    pid_batch = tl.program_id(2)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(0)
+
+    batch_offset_am = tl.load(a_offsets_ptr + pid_batch)
+    batch_offset_bk = tl.load(b_offsets_ptr + pid_batch)
+    batch_offset_cm = tl.load(c_offsets_ptr + pid_batch)
+
+    # calculate M, N, K
+    batch_K = tl.load(b_offsets_ptr + pid_batch + 1) - batch_offset_bk  # b [batch_K, D]
+    batch_M = tl.load(c_offsets_ptr + pid_batch + 1) - batch_offset_cm
+
+    # use uncapped seq length to determine strides of a
+    stride_am = batch_M * (1 - transpose) + 1 * transpose
+    stride_ak = batch_M * transpose + 1 * (1 - transpose)
+
+    # truncate seq length
+    batch_K = tl.minimum(batch_K, max_seq_len)
+    batch_M = tl.minimum(batch_M, max_seq_len)
+
+    if batch_K == 0:
+        return
+
+    batch_N = D
+
+    # c [batch_M, D] boundary check
+    if pid_m * BLOCK_SIZE_M >= batch_M or pid_n * BLOCK_SIZE_N >= batch_N:
+        return
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % batch_M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % batch_N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = (
+        a_ptr
+        + batch_offset_am
+        + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    )
+    b_ptrs = (
+        b_ptr
+        + batch_offset_bk * stride_bk
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    )
+
+    c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(batch_K, BLOCK_SIZE_K)):
+        a = tl.load(
+            a_ptrs, mask=offs_k[None, :] < batch_K - k * BLOCK_SIZE_K, other=0.0
+        )
+        b = tl.load(
+            b_ptrs, mask=offs_k[:, None] < batch_K - k * BLOCK_SIZE_K, other=0.0
+        )
+        c += tl.dot(a, b, allow_tf32=allow_tf32)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (
+        c_ptr
+        + stride_cm * batch_offset_cm
+        + stride_cm * offs_cm[:, None]
+        + stride_cn * offs_cn[None, :]
+    )
+    c_mask = (offs_cm[:, None] < batch_M) & (offs_cn[None, :] < batch_N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def jagged_jagged_bmm_jagged_out_kernel(
+    a_ptr,
+    a_offset_ptr,
+    b_ptr,
+    b_offset_ptr,
+    c_ptr,
+    offsets_mn_ptr,
+    max_seq_len,
+    num_blocks_n,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    allow_tf32: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """
+    Kernel for computing C = A x B.
+    A has shape (sum_B(Mi), K), B has shape (K, sum_B(Ni))
+    and C has shape (sum_B(Mi * Ni))
+    """
+
+    pid = tl.program_id(axis=0)
+    pid_batch = tl.program_id(axis=1)
+
+    begin_a = tl.load(a_offset_ptr + pid_batch)
+    end_a = tl.load(a_offset_ptr + pid_batch + 1)
+
+    begin_b = tl.load(b_offset_ptr + pid_batch)
+    end_b = tl.load(b_offset_ptr + pid_batch + 1)
+
+    offset_mn = tl.load(offsets_mn_ptr + pid_batch)
+
+    M = end_a - begin_a
+    M = tl.minimum(M, max_seq_len)
+
+    N = end_b - begin_b
+    N = tl.minimum(N, max_seq_len)
+
+    pid_m = pid // num_blocks_n
+    pid_n = pid % num_blocks_n
+
+    if pid_m * BLOCK_SIZE_M >= M or pid_n * BLOCK_SIZE_N >= N:
+        return
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = (
+        a_ptr
+        + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        + begin_a * stride_am
+    )
+
+    b_ptrs = (
+        b_ptr
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        + begin_b * stride_bn
+    )
+
+    c = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_SIZE_K):
+        updated_offset = k + offs_k
+        a = tl.load(
+            a_ptrs,
+            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
+            mask=((updated_offset[None, :] < K) & (offs_am[:, None] < M)),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=((updated_offset[:, None] < K) & (offs_bn[None, :] < N)),
+            other=0.0,
+        )
+        c += tl.dot(a, b, allow_tf32=allow_tf32)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offset_mn + N * offs_cm[:, None] + offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
 def triton_jagged_dense_bmm(a, b, a_offsets, max_seq_len, allow_tf32):
     # checks constraints
     assert a.shape[1] == b.shape[1], "incompatible dimensions"
@@ -683,6 +862,109 @@ def triton_jagged_dense_elementwise_mul_jagged_out(
     return jagged_C
 
 
+def triton_array_jagged_bmm_jagged_out(
+    array_A,
+    jagged_B,
+    lengths_am,
+    lengths_bk,
+    lengths_cm,
+    offsets_am,
+    offsets_bk,
+    offsets_cm,
+    max_seq_len,
+    allow_tf32=False,
+    transpose=0,  # one if a is transpose, otherwise zero
+):
+    B = lengths_am.size(0)
+    D = jagged_B.size(1)
+    L = jagged_B.size(0)
+    # gradients of the emb vectors beyond max_seq_len is set to zeros
+    jagged_C = torch.zeros((L, D), device=jagged_B.device, dtype=jagged_B.dtype)
+
+    BLOCK_SIZE_M = 32
+    BLOCK_SIZE_N = 32
+    BLOCK_SIZE_K = 32
+
+    num_blocks_m = triton.cdiv(max_seq_len, BLOCK_SIZE_M)
+    num_blocks_n = triton.cdiv(D, BLOCK_SIZE_N)
+    grid = (num_blocks_n, num_blocks_m, B)
+
+    array_jagged_bmm_kernel[grid](
+        array_A,
+        jagged_B,
+        jagged_C,
+        offsets_am,
+        offsets_bk,
+        offsets_cm,
+        D,
+        jagged_B.stride(0),
+        jagged_B.stride(1),
+        jagged_C.stride(0),
+        jagged_C.stride(1),
+        transpose,
+        max_seq_len,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        allow_tf32,
+    )
+
+    return jagged_C
+
+
+def triton_jagged_jagged_bmm_jagged_out(
+    jagged_A,
+    jagged_B,
+    max_seq_len,
+    lengths_m,
+    lengths_n,
+    lengths_mn,
+    offsets_m,
+    offsets_n,
+    offsets_mn,
+    allow_tf32=False,
+):
+    assert jagged_A.size(1) == jagged_B.size(0), "incompatible dimensions"
+    assert offsets_mn.is_contiguous(), "mn offsets mush be contiguous"
+    assert offsets_m.is_contiguous(), "m offsets mush be contiguous"
+    assert offsets_n.is_contiguous(), "n offsets mush be contiguous"
+
+    B = lengths_m.size(0)
+    jagged_C = torch.zeros(
+        (lengths_mn.sum()), device=jagged_A.device, dtype=jagged_A.dtype
+    )
+
+    BLOCK_SIZE_M = 32
+    BLOCK_SIZE_N = 32
+    BLOCK_SIZE_K = 32
+
+    num_blocks_m = triton.cdiv(max_seq_len, BLOCK_SIZE_M)
+    num_blocks_n = triton.cdiv(max_seq_len, BLOCK_SIZE_N)
+    grid = (num_blocks_m * num_blocks_n, B)
+
+    jagged_jagged_bmm_jagged_out_kernel[grid](
+        jagged_A,
+        offsets_m,
+        jagged_B,
+        offsets_n,
+        jagged_C,
+        offsets_mn,
+        max_seq_len,
+        num_blocks_n,
+        jagged_A.size(1),
+        jagged_A.stride(0),
+        jagged_A.stride(1),
+        jagged_B.stride(0),
+        jagged_B.stride(1),
+        allow_tf32,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+    )
+
+    return jagged_C
+
+
 class JaggedDenseBmm(torch.autograd.Function):
     """
     Compute batch matrix multiplication between JaggedTensor and dense tensor
@@ -861,6 +1143,214 @@ class JaggedDenseElementwiseMul(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
+class ArrayJaggedBmmNopadding(torch.autograd.Function):
+    """
+    Compute batch matrix multiplication between JaggedTensor and JaggedTensor without padding.
+    z = X * Y
+    x: [Sum_B(N_i, N_i)]
+    y: [sum_B(N_i), D]
+    z: [sum_B(N_i), D]
+    """
+
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        x_lengths: torch.Tensor,
+        x_offsets: torch.Tensor,
+        y_lengths: torch.Tensor,
+        y_offsets: torch.Tensor,
+        z_lengths: torch.Tensor,
+        z_offsets: torch.Tensor,
+        max_seq_len: int,
+        allow_tf32,
+    ):
+        ctx.allow_tf32 = allow_tf32
+        ctx.max_seq_len = max_seq_len
+
+        ctx.save_for_backward(
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        )
+
+        return triton_array_jagged_bmm_jagged_out(
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+            max_seq_len,
+            allow_tf32,
+            0,
+        )
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        z = X * Y
+        dX = dZ * YT
+        dY = XT * dZ
+
+        dZ: [sum_B(N_i), D]
+        YT: [D, sum_B(N_i)] call Y.T
+        XT: transposed
+        Z: [sum_B(N_i), D]
+        """
+
+        (
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        ) = ctx.saved_tensors
+
+        grad_x = triton_jagged_jagged_bmm_jagged_out(
+            grad_output,
+            y.T,
+            ctx.max_seq_len,
+            z_lengths,
+            y_lengths,
+            x_lengths,
+            z_offsets,
+            y_offsets,
+            x_offsets,
+            ctx.allow_tf32,
+        )
+
+        grad_y = triton_array_jagged_bmm_jagged_out(
+            x,
+            grad_output,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+            ctx.max_seq_len,
+            ctx.allow_tf32,
+            1,
+        )
+        return grad_x, grad_y, None, None, None, None, None, None, None, None
+
+
+class JaggedJaggedBmmNoPadding(torch.autograd.Function):
+    """
+    Compute batch matrix multiplication between JaggedTensor and JaggedTensor without padding.
+    z = x x y^T
+    x: [sum_B(M_i), D]
+    y: [sum_B(N_i), D]
+    z: [sum_B(M_i * N_i)], assuming M_i = N_i
+    """
+
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        x_lengths: torch.Tensor,
+        x_offsets: torch.Tensor,
+        y_lengths: torch.Tensor,
+        y_offsets: torch.Tensor,
+        z_lengths: torch.Tensor,
+        z_offsets: torch.Tensor,
+        max_seq_len: int,
+        allow_tf32,
+    ):
+        ctx.allow_tf32 = allow_tf32
+        ctx.max_seq_len = max_seq_len
+
+        ctx.save_for_backward(
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        )
+
+        return triton_jagged_jagged_bmm_jagged_out(
+            x,
+            y.T,
+            max_seq_len,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+            allow_tf32,
+        )
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        z = x x y^T
+        x: [sum_B(M_i), D]
+        y: [sum_B(N_i), D]
+        z: [sum_B(M_i * N_i)], assuming M_i = N_i
+        dx = dz x (y^T)^T = > dx = dz x y
+        d(y^T) = x^T x dz => dy = dz^T x x
+        """
+        (
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        ) = ctx.saved_tensors
+
+        grad_x = triton_array_jagged_bmm_jagged_out(
+            grad_output,
+            y,
+            z_lengths,
+            y_lengths,
+            x_lengths,
+            z_offsets,
+            y_offsets,
+            x_offsets,
+            ctx.max_seq_len,
+            ctx.allow_tf32,
+            transpose=0,
+        )
+        grad_y = triton_array_jagged_bmm_jagged_out(
+            grad_output,
+            x,
+            z_lengths,
+            x_lengths,
+            y_lengths,
+            z_offsets,
+            x_offsets,
+            y_offsets,
+            ctx.max_seq_len,
+            ctx.allow_tf32,
+            transpose=1,
+        )
+        return grad_x, grad_y, None, None, None, None, None, None, None, None
+
+
 def jagged_dense_bmm(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -931,4 +1421,508 @@ def jagged_dense_elementwise_mul_jagged_out(
         x_seq_lengths,
         x_offsets,
         max_seq_len,
+    )
+
+
+@triton.jit
+def jagged_softmax_kernel(
+    input_ptr,
+    output_ptr,
+    input_offsets_ptr,
+    input_row_stride,
+    input_head_stride,
+    output_row_stride,
+    output_head_stride,
+    max_seq_len: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # BLOCK_SIZE > N (seq len)
+):
+    """
+    input shpae is [SUM_B, H]
+    output shape is [SUM_B, H]
+    """
+
+    pid_batch = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    row_begin = tl.load(input_offsets_ptr + pid_batch)
+    row_end = tl.load(input_offsets_ptr + pid_batch + 1)
+    N = tl.minimum(
+        max_seq_len, row_end - row_begin
+    )  # number of rows to consider softmax
+    if N == 0:
+        return
+
+    row_start_ptr = input_ptr + row_begin * input_row_stride
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    input_ptrs = (
+        row_start_ptr + col_offsets * input_row_stride + pid_head * input_head_stride
+    )
+    row = tl.load(input_ptrs, mask=col_offsets < N, other=-float("inf"))
+    row_mins_max = row - tl.max(row, axis=0)
+    numerator = tl.exp(row_mins_max)
+    denominator = tl.sum(numerator, axis=0)
+    softmax_output = numerator / denominator
+
+    output_row_start_ptr = output_ptr + row_begin * output_row_stride
+    output_ptrs = (
+        output_row_start_ptr
+        + col_offsets * output_row_stride
+        + pid_head * output_head_stride
+    )
+
+    tl.store(output_ptrs, softmax_output, mask=col_offsets < N)
+
+
+def jagged_softmax_(x: torch.Tensor, x_offsets: torch.Tensor, max_seq_len: int):
+    sum_B, H = x.shape
+    B = x_offsets.size(0) - 1
+    BLOCK_SIZE = max(triton.next_power_of_2(max_seq_len), 8)
+
+    y = torch.zeros(
+        sum_B, H, device=x.device, dtype=x.dtype
+    )  # use zeros instead of empty to ensure the consistent behavior compare to padded version
+    jagged_softmax_kernel[(B, H)](
+        x,
+        y,
+        x_offsets,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        # pyre-fixme[6]: Incompatible parameter type [6]: expected `constexpr` but got `int`.
+        max_seq_len,
+        # pyre-fixme[6]: Incompatible parameter type [6]: expected `constexpr` but got `int`.
+        BLOCK_SIZE,
+    )
+
+    return y
+
+
+@triton.jit
+def jagged_softmax_backward_kernel(
+    grad_output_ptr,
+    softmax_output_ptr,
+    grad_input_ptr,  # return value
+    input_offsets_ptr,
+    grad_output_row_stride,
+    grad_output_head_stride,
+    softmax_output_row_stride,
+    softmax_output_head_stride,
+    grad_input_row_stride,
+    grad_input_head_stride,
+    max_seq_len: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    grad_output_ptr shpae is [SUM_B, H]
+    softmax_output shape is [SUM_B, H]
+    grad_input shape is [SUM_B, H]
+    """
+
+    pid_batch = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    row_begin = tl.load(input_offsets_ptr + pid_batch)
+    row_end = tl.load(input_offsets_ptr + pid_batch + 1)
+    N = tl.minimum(
+        max_seq_len, row_end - row_begin
+    )  # number of rows to consider softmax
+
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    grad_output_ptrs = (
+        grad_output_ptr
+        + row_begin * grad_output_row_stride
+        + col_offsets * grad_output_row_stride
+        + pid_head * grad_output_head_stride
+    )
+    softmax_output_ptrs = (
+        softmax_output_ptr
+        + row_begin * softmax_output_row_stride
+        + col_offsets * softmax_output_row_stride
+        + pid_head * softmax_output_head_stride
+    )
+    grad_output_row = tl.load(grad_output_ptrs, mask=col_offsets < N, other=0.0)
+    softmax_output_row = tl.load(softmax_output_ptrs, mask=col_offsets < N, other=0.0)
+
+    sum_value = tl.sum(grad_output_row * softmax_output_row, axis=0)
+    grad_input_row = (grad_output_row - sum_value) * softmax_output_row
+    grad_input_ptrs = (
+        grad_input_ptr
+        + row_begin * grad_input_row_stride
+        + col_offsets * grad_input_row_stride
+        + pid_head * grad_input_head_stride
+    )
+    tl.store(grad_input_ptrs, grad_input_row, mask=col_offsets < N)
+
+
+class JaggedSoftmax(torch.autograd.Function):
+    @staticmethod
+    # pyre-fixme
+    def forward(ctx, x: torch.Tensor, x_offsets: torch.Tensor, max_seq_len: int):
+        y = jagged_softmax_(x, x_offsets, max_seq_len)
+        ctx.save_for_backward(y, x_offsets)
+        ctx.max_seq_len = max_seq_len
+
+        return y
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        y, x_offsets = ctx.saved_tensors
+        max_seq_len = ctx.max_seq_len
+
+        sum_B, H = y.shape
+        B = x_offsets.size(0) - 1
+        BLOCK_SIZE = max(triton.next_power_of_2(max_seq_len), 8)
+        grad = torch.zeros(
+            sum_B, H, device=y.device, dtype=y.dtype
+        )  # use zeros instead of empty to guarantee the behavior
+
+        jagged_softmax_backward_kernel[(B, H)](
+            grad_output,
+            y,
+            grad,
+            x_offsets,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            y.stride(0),
+            y.stride(1),
+            grad.stride(0),
+            grad.stride(1),
+            max_seq_len,
+            # pyre-fixme[6]: Incompatible parameter type [6]: expected `constexpr` but got `int`.
+            BLOCK_SIZE,
+        )
+
+        return grad, None, None
+
+
+def jagged_softmax(
+    x: torch.Tensor,
+    x_offsets: torch.Tensor,
+    max_seq_len: int,
+    use_fbgemm_kernel: bool = True,
+):
+    """
+    GPU version of jagged softmax: [sum(softmax([B_i, D]))]
+    """
+    if use_fbgemm_kernel:
+        return torch.ops.fbgemm.jagged_softmax(x, x_offsets, max_seq_len)[0]
+    else:
+        return JaggedSoftmax.apply(x, x_offsets, max_seq_len)
+
+
+# works now
+# we use row offset for softmax calculation
+# for now, offsets row == offsets col
+@triton.jit
+def jagged_2_softmax_kernel(
+    input_ptr,
+    output_ptr,
+    offsets_row_ptr,  # seq
+    offsets_col_ptr,  # head
+    offsets_overall_ptr,  # offsets for overall matrix = seq_length_i * head_i
+    input_stride,
+    output_stride,
+    transpose,  # one if a is transpose, otherwise zero
+    max_seq_len_row,  # max_seq_len for row (seq)
+    max_seq_len_col,  # max_seq_len for col (head)
+    BLOCK_SIZE: tl.constexpr,  # BLOCK_SIZE > seq_length
+):
+    """
+    input shape is [sum_B(Ni * Hi)]
+    output shape is [sum_B(Ni * Hi)]
+    Padded version = [B, N, H]
+    Calculate softmax alone N dim
+    Each kernel calulates softmax for 1 sample and 1 head
+    offsets_row.size == offsets_col.size == offsets_overall.size
+    """
+
+    pid_batch = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    # start location of current example
+    begin = tl.load(offsets_overall_ptr + pid_batch)
+    # end = tl.load(offsets_overall_ptr + pid_batch + 1)  # noqa F841
+    # end - begin = M_i * N_i
+
+    # softmax on row
+    if transpose:
+        N = tl.load(offsets_row_ptr + pid_batch + 1) - tl.load(
+            offsets_row_ptr + pid_batch
+        )
+        H = tl.load(offsets_col_ptr + pid_batch + 1) - tl.load(
+            offsets_col_ptr + pid_batch
+        )
+        stride_n = H
+        stride_h = H // H  # 1
+        # sometimes H is larger than max_seq_len_col
+        H = tl.minimum(max_seq_len_col, H)
+        N = tl.minimum(max_seq_len_row, N)
+    # softmax on col
+    else:
+        N = tl.load(offsets_col_ptr + pid_batch + 1) - tl.load(
+            offsets_col_ptr + pid_batch
+        )
+        H = tl.load(offsets_row_ptr + pid_batch + 1) - tl.load(
+            offsets_row_ptr + pid_batch
+        )
+        stride_h = N
+        stride_n = N // N  # 1
+        H = tl.minimum(max_seq_len_row, H)
+        N = tl.minimum(max_seq_len_col, N)
+
+    if pid_head >= H:  # TODO double check the equal here
+        return
+    if H == 0 or N == 0:
+        return
+
+    # start of the current example
+    start_ptr = input_ptr + begin * input_stride
+    # offset for n
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    # Load a softmax row
+    input_ptrs = (
+        start_ptr
+        + offsets * input_stride * stride_n
+        + pid_head * input_stride * stride_h
+    )  # start + n offsets + head offset
+    row = tl.load(input_ptrs, mask=offsets < N, other=-float("inf"))
+    row_mins_max = row - tl.max(row, axis=0)
+    numerator = tl.exp(row_mins_max)
+    denominator = tl.sum(numerator, axis=0)
+    softmax_output = numerator / denominator
+
+    # calculate output ptr, should be similar to input
+    output_start_ptr = output_ptr + begin * output_stride
+    output_ptrs = (
+        output_start_ptr
+        + offsets * output_stride * stride_n
+        + pid_head * output_stride * stride_h
+    )
+    tl.store(output_ptrs, softmax_output, mask=offsets < N)
+
+
+# TODO, pending test
+@triton.jit
+def jagged_2_softmax_backward_kernel(
+    grad_output_ptr,  # input
+    softmax_output_ptr,
+    grad_input_ptr,  # return value
+    offsets_row_ptr,
+    offsets_col_ptr,
+    offsets_overall_ptr,
+    grad_output_stride,
+    softmax_output_stride,
+    grad_input_stride,
+    transpose,  # transpose
+    max_seq_len_row: tl.constexpr,
+    max_seq_len_col: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    begin = tl.load(offsets_overall_ptr + pid_batch)
+    # end = tl.load(offsets_overall_ptr + pid_batch + 1)  # noqa F841
+
+    # softmax on row
+    if transpose:
+        N = tl.load(offsets_row_ptr + pid_batch + 1) - tl.load(
+            offsets_row_ptr + pid_batch
+        )
+        H = tl.load(offsets_col_ptr + pid_batch + 1) - tl.load(
+            offsets_col_ptr + pid_batch
+        )
+        stride_n = H
+        stride_h = H // H  # 1
+        # sometimes H is larger than max_seq_len_col
+        H = tl.minimum(max_seq_len_col, H)
+        N = tl.minimum(max_seq_len_row, N)
+    # softmax on col
+    else:
+        N = tl.load(offsets_col_ptr + pid_batch + 1) - tl.load(
+            offsets_col_ptr + pid_batch
+        )
+        H = tl.load(offsets_row_ptr + pid_batch + 1) - tl.load(
+            offsets_row_ptr + pid_batch
+        )
+        stride_h = N
+        stride_n = N // N  # 1
+        H = tl.minimum(max_seq_len_row, H)
+        N = tl.minimum(max_seq_len_col, N)
+
+    if pid_head >= H:
+        return
+    if H == 0 or N == 0:
+        pass
+
+    start_ptr = grad_output_ptr + begin * grad_output_stride
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    grad_output_ptrs = (
+        start_ptr
+        + offsets * grad_output_stride * stride_n
+        + pid_head * grad_output_stride * stride_h
+    )
+    softmax_output_ptrs = (
+        softmax_output_ptr
+        + begin * softmax_output_stride
+        + offsets * softmax_output_stride * stride_n
+        + pid_head * softmax_output_stride * stride_h
+    )
+
+    grad_output_row = tl.load(grad_output_ptrs, mask=offsets < N, other=0.0)
+    softmax_output_row = tl.load(softmax_output_ptrs, mask=offsets < N, other=0.0)
+
+    sum_value = tl.sum(grad_output_row * softmax_output_row, axis=0)
+    grad_input_row = (grad_output_row - sum_value) * softmax_output_row
+
+    grad_input_row_start_ptr = grad_input_ptr + begin * grad_input_stride
+    grad_input_ptrs = (
+        grad_input_row_start_ptr
+        + offsets * grad_input_stride * stride_n
+        + pid_head * grad_input_stride * stride_h
+    )
+    tl.store(grad_input_ptrs, grad_input_row, mask=offsets < N)
+
+
+class Jagged2Softmax(torch.autograd.Function):
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        row_offsets: torch.Tensor,
+        head_offsets: torch.Tensor,
+        max_seq_len_row: int,
+        max_seq_len_head: int,
+        transpose: bool = True,
+    ) -> torch.Tensor:
+        B = x_offsets.size(0) - 1
+        BLOCK_SIZE = max(triton.next_power_of_2(max_seq_len_row), 8)
+
+        y = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+        jagged_2_softmax_kernel[(B, max_seq_len_head)](
+            x,
+            y,
+            row_offsets,
+            head_offsets,
+            x_offsets,
+            x.stride(0),
+            y.stride(0),
+            transpose,  # transpose
+            max_seq_len_row,
+            max_seq_len_head,
+            # pyre-fixme[6]: Incompatible parameter type [6]: expected `constexpr` but got `int`.
+            BLOCK_SIZE,
+        )
+
+        ctx.save_for_backward(y, x_offsets, row_offsets, head_offsets)
+        ctx.max_seq_len_row = max_seq_len_row
+        ctx.max_seq_len_head = max_seq_len_head
+        ctx.transpose = transpose
+
+        return y
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        # TODO: currently backward kernel have small numerical issues.
+        y, x_offsets, row_offsets, head_offsets = ctx.saved_tensors
+        B = x_offsets.size(0) - 1
+        max_seq_len_row = ctx.max_seq_len_row
+        max_seq_len_head = ctx.max_seq_len_head
+        BLOCK_SIZE = max(triton.next_power_of_2(max_seq_len_row), 8)
+
+        grad = torch.zeros(y.size(0), device=y.device, dtype=y.dtype)
+
+        jagged_2_softmax_backward_kernel[(B, max_seq_len_head)](
+            grad_output,
+            y,
+            grad,
+            row_offsets,
+            head_offsets,
+            x_offsets,
+            grad_output.stride(0),
+            softmax_output_stride=y.stride(0),
+            grad_input_stride=grad.stride(0),
+            transpose=ctx.transpose,  # transpose
+            max_seq_len_row=max_seq_len_row,
+            max_seq_len_col=max_seq_len_head,
+            # pyre-fixme[6]: Incompatible parameter type [6]: expected `constexpr` but got `int`.
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        return grad, None, None, None, None, None, None
+
+
+def jagged2_softmax(
+    x: torch.Tensor,
+    offsets: torch.Tensor,
+    offsets_total: torch.Tensor,
+    max_seq_len: int,
+    transpose: bool,
+):
+    """
+    GPU version of jagged2 softmax: [sum(softmax([B_i, B_i]))]
+    """
+    return Jagged2Softmax.apply(
+        x,
+        offsets_total,
+        offsets,
+        offsets,
+        max_seq_len,
+        max_seq_len,
+        transpose,
+    )
+
+
+def array_jagged_bmm_jagged_out(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    x_lengths: torch.Tensor,
+    x_offsets: torch.Tensor,
+    y_lengths: torch.Tensor,
+    y_offsets: torch.Tensor,
+    z_lengths: torch.Tensor,
+    z_offsets: torch.Tensor,
+    max_seq_len: int,
+    allow_tf32: bool = True,
+):
+    return ArrayJaggedBmmNopadding.apply(
+        x,
+        y,
+        x_lengths,
+        x_offsets,
+        y_lengths,
+        y_offsets,
+        z_lengths,
+        z_offsets,
+        max_seq_len,
+        allow_tf32,
+    )
+
+
+def jagged_jagged_bmm_jagged_out(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    x_lengths: torch.Tensor,
+    x_offsets: torch.Tensor,
+    y_lengths: torch.Tensor,
+    y_offsets: torch.Tensor,
+    z_lengths: torch.Tensor,
+    z_offsets: torch.Tensor,
+    max_seq_len: int,
+    allow_tf32: bool = True,
+):
+    return JaggedJaggedBmmNoPadding.apply(
+        x,
+        y,
+        x_lengths,
+        x_offsets,
+        y_lengths,
+        y_offsets,
+        z_lengths,
+        z_offsets,
+        max_seq_len,
+        allow_tf32,
     )

@@ -409,3 +409,489 @@ def meta_jagged_dense_elementwise_mul_jagged_out(
         x_offsets,
         max_seq_len,
     )
+
+
+class JaggedSoftmaxCPU(torch.autograd.Function):
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        ctx: Any,  # pyre-ignore
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """
+        input shpae is [SUM_B, D]
+        output shape is [SUM_B, D]
+        """
+        B = x_offsets.size(0) - 1
+        y = torch.zeros(x.size(), device=x.device, dtype=x.dtype)
+
+        for b in range(B):
+            y[x_offsets[b] : x_offsets[b + 1], :] = torch.nn.functional.softmax(
+                x[x_offsets[b] : x_offsets[b + 1], :], dim=0
+            )
+
+        ctx.save_for_backward(y, x_offsets)
+
+        return y
+
+    @staticmethod
+    # pyre-fixme
+    def backward(
+        ctx: Any, grad_output: torch.Tensor  # pyre-ignore
+    ) -> Tuple[torch.Tensor, None, None]:
+        y, x_offsets = ctx.saved_tensors
+
+        B = x_offsets.size(0) - 1
+        grad = torch.zeros(y.size(), device=y.device, dtype=y.dtype)
+
+        for b in range(B):
+            curr_y = y[x_offsets[b] : x_offsets[b + 1]]
+            curr_grad = grad_output[x_offsets[b] : x_offsets[b + 1]]
+            grad[x_offsets[b] : x_offsets[b + 1]] = curr_y * (
+                curr_grad - torch.sum(curr_grad * curr_y, dim=0, keepdim=True)
+            )
+
+        return grad, None, None
+
+
+def cpu_jagged_softmax(
+    x: torch.Tensor,
+    x_offsets: torch.Tensor,
+    max_seq_len: int,
+    use_fbgemm_kernel: bool = True,
+) -> torch.Tensor:
+    """
+    CPU version of jagged softmax: [sum(softmax([B_i, D]))]
+    """
+    # Force the CPU backend to use fbgemm kernel as it has better performance
+    use_fbgemm_kernel = True
+    if use_fbgemm_kernel:
+        return torch.ops.fbgemm.jagged_softmax(x, x_offsets, max_seq_len)[0]
+    else:
+        return JaggedSoftmaxCPU.apply(x, x_offsets, max_seq_len)
+
+
+class Jagged2SoftmaxCPU(torch.autograd.Function):
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        # pyre-fixme[2]: Parameter must be annotated.
+        ctx,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        row_offsets: torch.Tensor,
+        head_offsets: torch.Tensor,
+        max_seq_len_row: int,
+        max_seq_len_head: int,
+        transpose: bool = True,
+    ) -> torch.Tensor:
+        B = x_offsets.size(0) - 1
+        y = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+
+        for i in range(B):
+            submatrix = x[x_offsets[i] : x_offsets[i + 1]]
+            Ni = int(row_offsets[i + 1] - row_offsets[i])
+            softmax_dim = 0 if transpose else 1
+            y[x_offsets[i] : x_offsets[i + 1]] = torch.nn.functional.softmax(
+                submatrix.reshape((Ni, Ni)), dim=softmax_dim
+            ).view(-1)
+
+        ctx.save_for_backward(y, x_offsets, row_offsets, head_offsets)
+        ctx.max_seq_len_row = max_seq_len_row
+        ctx.max_seq_len_head = max_seq_len_head
+        ctx.transpose = transpose
+
+        return y
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        y, x_offsets, row_offsets, head_offsets = ctx.saved_tensors
+        B = x_offsets.size(0) - 1
+        transpose = ctx.transpose
+        softmax_dim = 0 if transpose else -1
+        grad = torch.zeros(y.size(0), device=y.device, dtype=y.dtype)
+
+        for i in range(B):
+            Ni = row_offsets[i + 1] - row_offsets[i]
+            curr_y = y[x_offsets[i] : x_offsets[i + 1]].reshape(Ni, Ni)
+            curr_grad = grad_output[x_offsets[i] : x_offsets[i + 1]].reshape(Ni, Ni)
+            grad[x_offsets[i] : x_offsets[i + 1]] = (
+                curr_y
+                * (
+                    curr_grad
+                    - torch.sum(curr_grad * curr_y, dim=softmax_dim, keepdim=True)
+                )
+            ).view(-1)
+
+        return grad, None, None, None, None, None, None
+
+
+def cpu_jagged2_softmax(
+    x: torch.Tensor,
+    offsets: torch.Tensor,
+    offsets_total: torch.Tensor,
+    max_seq_len: int,
+    transpose: bool,
+) -> torch.Tensor:
+    """
+    GPU version of jagged2 softmax: [sum(softmax([B_i, B_i]))]
+    """
+    return Jagged2SoftmaxCPU.apply(
+        x,
+        offsets_total,
+        offsets,
+        offsets,
+        max_seq_len,
+        max_seq_len,
+        transpose,
+    )
+
+
+# pyre-fixme[3]: Return type must be annotated.
+def cpu_jagged_jagged_bmm_jagged_out_kernel(
+    # pyre-fixme[2]: Parameter must be annotated.
+    jagged_A,
+    # pyre-fixme[2]: Parameter must be annotated.
+    jagged_B,
+    # pyre-fixme[2]: Parameter must be annotated.
+    max_seq_len,
+    # pyre-fixme[2]: Parameter must be annotated.
+    lengths_m,
+    # pyre-fixme[2]: Parameter must be annotated.
+    lengths_n,
+    # pyre-fixme[2]: Parameter must be annotated.
+    lengths_mn,
+    # pyre-fixme[2]: Parameter must be annotated.
+    offsets_m,
+    # pyre-fixme[2]: Parameter must be annotated.
+    offsets_n,
+    # pyre-fixme[2]: Parameter must be annotated.
+    offsets_mn,
+    # pyre-fixme[2]: Parameter must be annotated.
+    allow_tf32=False,
+):
+    jagged_C = torch.empty((int(lengths_mn.sum().item())), dtype=jagged_A.dtype).to(
+        jagged_A.device
+    )
+    B = lengths_m.size(0)
+
+    for i in range(B):
+        jagged_C[offsets_mn[i] : offsets_mn[i + 1]] = torch.matmul(
+            jagged_A[offsets_m[i] : offsets_m[i + 1]],
+            jagged_B[offsets_n[i] : offsets_n[i + 1]].T,
+        ).flatten()
+    return jagged_C
+
+
+# pyre-fixme[3]: Return type must be annotated.
+def cpu_array_jagged_bmm_jagged_out_kernel(
+    # pyre-fixme[2]: Parameter must be annotated.
+    array_A,
+    # pyre-fixme[2]: Parameter must be annotated.
+    jagged_B,
+    # pyre-fixme[2]: Parameter must be annotated.
+    lengths_am,
+    # pyre-fixme[2]: Parameter must be annotated.
+    lengths_bk,
+    # pyre-fixme[2]: Parameter must be annotated.
+    lengths_cm,
+    # pyre-fixme[2]: Parameter must be annotated.
+    offsets_am,
+    # pyre-fixme[2]: Parameter must be annotated.
+    offsets_bk,
+    # pyre-fixme[2]: Parameter must be annotated.
+    offsets_cm,
+    # pyre-fixme[2]: Parameter must be annotated.
+    max_seq_len,
+    # pyre-fixme[2]: Parameter must be annotated.
+    allow_tf32=False,
+    # pyre-fixme[2]: Parameter must be annotated.
+    transpose=0,  # one if a is transpose, otherwise zero
+):
+    B = lengths_am.size(0)
+    D = jagged_B.size(1)
+    jagged_C = torch.zeros(
+        (int(lengths_cm.sum()), D), device=jagged_B.device, dtype=jagged_B.dtype
+    )
+
+    for i in range(B):
+        seq_len = int(lengths_bk[i])
+        capped_seq_len = min(seq_len, max_seq_len)
+        a = array_A[offsets_am[i] : offsets_am[i + 1]].view(seq_len, seq_len)
+        a = a[:capped_seq_len, :capped_seq_len]
+
+        if transpose:
+            a = a.T
+        b = jagged_B[offsets_bk[i] : offsets_bk[i] + capped_seq_len]
+        jagged_C[offsets_cm[i] : offsets_cm[i] + capped_seq_len] = torch.matmul(a, b)
+
+    return jagged_C
+
+
+class ArrayJaggedBmmNopaddingCPU(torch.autograd.Function):
+    """
+    Compute batch matrix multiplication between JaggedTensor and JaggedTensor without padding.
+    z = X * Y
+    x: [Sum_B(N_i, N_i)]
+    y: [sum_B(N_i), D]
+    z: [sum_B(N_i), D]
+    """
+
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        # pyre-fixme[2]: Parameter must be annotated.
+        ctx,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        x_lengths: torch.Tensor,
+        x_offsets: torch.Tensor,
+        y_lengths: torch.Tensor,
+        y_offsets: torch.Tensor,
+        z_lengths: torch.Tensor,
+        z_offsets: torch.Tensor,
+        max_seq_len: int,
+        # pyre-fixme[2]: Parameter must be annotated.
+        allow_tf32,
+    ):
+        ctx.allow_tf32 = allow_tf32
+        ctx.max_seq_len = max_seq_len
+
+        ctx.save_for_backward(
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        )
+
+        return cpu_array_jagged_bmm_jagged_out_kernel(
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+            max_seq_len,
+            allow_tf32,
+            0,
+        )
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        z = X * Y
+        dX = dZ * YT
+        dY = XT * dZ
+
+        dZ: [sum_B(N_i), D]
+        YT: [D, sum_B(N_i)] call Y.T
+        XT: transposed
+        Z: [sum_B(N_i), D]
+        """
+
+        (
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        ) = ctx.saved_tensors
+
+        grad_x = cpu_jagged_jagged_bmm_jagged_out_kernel(
+            grad_output,
+            y,
+            ctx.max_seq_len,
+            z_lengths,
+            y_lengths,
+            x_lengths,
+            z_offsets,
+            y_offsets,
+            x_offsets,
+            ctx.allow_tf32,
+        )
+
+        grad_y = cpu_array_jagged_bmm_jagged_out_kernel(
+            x,
+            grad_output,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+            ctx.max_seq_len,
+            ctx.allow_tf32,
+            1,
+        )
+        return grad_x, grad_y, None, None, None, None, None, None, None, None
+
+
+# pyre-fixme[3]: Return type must be annotated.
+def cpu_array_jagged_bmm_jagged_out(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    x_lengths: torch.Tensor,
+    x_offsets: torch.Tensor,
+    y_lengths: torch.Tensor,
+    y_offsets: torch.Tensor,
+    z_lengths: torch.Tensor,
+    z_offsets: torch.Tensor,
+    max_seq_len: int,
+    allow_tf32: bool = True,
+):
+    return ArrayJaggedBmmNopaddingCPU.apply(
+        x,
+        y,
+        x_lengths,
+        x_offsets,
+        y_lengths,
+        y_offsets,
+        z_lengths,
+        z_offsets,
+        max_seq_len,
+        allow_tf32,
+    )
+
+
+class JaggedJaggedBmmNoPaddingCPU(torch.autograd.Function):
+    """
+    Compute batch matrix multiplication between JaggedTensor and JaggedTensor without padding.
+    z = x x y^T
+    x: [sum_B(M_i), D]
+    y: [sum_B(N_i), D]
+    z: [sum_B(M_i * N_i)], assuming M_i = N_i
+    """
+
+    @staticmethod
+    # pyre-fixme
+    def forward(
+        # pyre-fixme[2]: Parameter must be annotated.
+        ctx,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        x_lengths: torch.Tensor,
+        x_offsets: torch.Tensor,
+        y_lengths: torch.Tensor,
+        y_offsets: torch.Tensor,
+        z_lengths: torch.Tensor,
+        z_offsets: torch.Tensor,
+        max_seq_len: int,
+        # pyre-fixme[2]: Parameter must be annotated.
+        allow_tf32,
+    ):
+        ctx.allow_tf32 = allow_tf32
+        ctx.max_seq_len = max_seq_len
+
+        ctx.save_for_backward(
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        )
+
+        return cpu_jagged_jagged_bmm_jagged_out_kernel(
+            x,
+            y,
+            max_seq_len,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+            allow_tf32,
+        )
+
+    @staticmethod
+    # pyre-fixme
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        z = x x y^T
+        x: [sum_B(M_i), D]
+        y: [sum_B(N_i), D]
+        z: [sum_B(M_i * N_i)], assuming M_i = N_i
+        dx = dz x (y^T)^T = > dx = dz x y
+        d(y^T) = x^T x dz => dy = dz^T x x
+        """
+        (
+            x,
+            y,
+            x_lengths,
+            y_lengths,
+            z_lengths,
+            x_offsets,
+            y_offsets,
+            z_offsets,
+        ) = ctx.saved_tensors
+
+        grad_x = cpu_array_jagged_bmm_jagged_out_kernel(
+            grad_output,
+            y,
+            z_lengths,
+            y_lengths,
+            x_lengths,
+            z_offsets,
+            y_offsets,
+            x_offsets,
+            ctx.max_seq_len,
+            ctx.allow_tf32,
+            transpose=0,
+        )
+        grad_y = cpu_array_jagged_bmm_jagged_out_kernel(
+            grad_output,
+            x,
+            z_lengths,
+            x_lengths,
+            y_lengths,
+            z_offsets,
+            x_offsets,
+            y_offsets,
+            ctx.max_seq_len,
+            ctx.allow_tf32,
+            transpose=1,
+        )
+        return grad_x, grad_y, None, None, None, None, None, None, None, None
+
+
+# pyre-fixme[3]: Return type must be annotated.
+def cpu_jagged_jagged_bmm_jagged_out(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    x_lengths: torch.Tensor,
+    x_offsets: torch.Tensor,
+    y_lengths: torch.Tensor,
+    y_offsets: torch.Tensor,
+    z_lengths: torch.Tensor,
+    z_offsets: torch.Tensor,
+    max_seq_len: int,
+    allow_tf32: bool = True,
+):
+    return JaggedJaggedBmmNoPaddingCPU.apply(
+        x,
+        y,
+        x_lengths,
+        x_offsets,
+        y_lengths,
+        y_offsets,
+        z_lengths,
+        z_offsets,
+        max_seq_len,
+        allow_tf32,
+    )

@@ -7,25 +7,41 @@
 
 # pyre-strict
 
+from typing import Callable, Dict
+
 import torch
 
 from fbgemm_gpu.sll.cpu_sll import (  # noqa F401
+    cpu_array_jagged_bmm_jagged_out,
     cpu_dense_jagged_cat_jagged_out,
+    cpu_jagged2_softmax,
     cpu_jagged2_to_padded_dense,
     cpu_jagged_dense_bmm,
     cpu_jagged_dense_elementwise_mul_jagged_out,
     cpu_jagged_jagged_bmm,
+    cpu_jagged_jagged_bmm_jagged_out,
     cpu_jagged_self_substraction_jagged_out,
+    cpu_jagged_softmax,
     meta_jagged_dense_elementwise_mul_jagged_out,
     meta_jagged_self_substraction_jagged_out,
 )
 
+from fbgemm_gpu.sll.meta_sll import (  # noqa F401
+    meta_array_jagged_bmm_jagged_out,
+    meta_jagged2_softmax,
+    meta_jagged_jagged_bmm_jagged_out,
+)
+
 from fbgemm_gpu.sll.triton_sll import (  # noqa F401
+    array_jagged_bmm_jagged_out,
     dense_jagged_cat_jagged_out,
+    jagged2_softmax,
     jagged2_to_padded_dense,
     jagged_dense_bmm,
     jagged_dense_elementwise_mul_jagged_out,
     jagged_jagged_bmm,
+    jagged_jagged_bmm_jagged_out,
+    jagged_softmax,
     triton_jagged_self_substraction_jagged_out,
 )
 
@@ -62,6 +78,27 @@ def op_registeration(
 
 
 lib = torch.library.Library("fbgemm", "FRAGMENT")
+
+
+# pyre-ignore[24]
+def register_sll_op(op_name: str, functors: Dict[str, Callable]) -> None:
+    valid_backends = [
+        "CUDA",
+        "AutogradCUDA",
+        "CPU",
+        "AutogradCPU",
+        "AutogradMeta",
+        "Meta",
+    ]
+    for backend, func in functors.items():
+        assert backend in valid_backends
+        op_registeration(
+            lib,
+            op_name,
+            func,
+            backend,
+        )
+
 
 if "fbgemm::sll_jagged_dense_bmm" not in torch.library._defs:
     lib.define(
@@ -134,76 +171,152 @@ if "fbgemm::sll_jagged_dense_elementwise_mul_jagged_out" not in torch.library._d
         """
     )
 
+if "fbgemm::sll_jagged_softmax" not in torch.library._defs:
+    lib.define(
+        """sll_jagged_softmax(Tensor x, Tensor x_offsets, int max_seq_len, bool use_fbgemm_kernel=True) -> Tensor
+        """
+    )
+
+if "fbgemm::sll_jagged2_softmax" not in torch.library._defs:
+    lib.define(
+        """sll_jagged2_softmax(Tensor x, Tensor offsets, Tensor offsets_total, int max_seq_len, bool transpose) -> Tensor
+        """
+    )
+
+if "fbgemm::array_jagged_bmm_jagged_out" not in torch.library._defs:
+    lib.define(
+        """array_jagged_bmm_jagged_out(
+            Tensor x,
+            Tensor y,
+            Tensor x_lengths,
+            Tensor x_offsets,
+            Tensor y_lengths,
+            Tensor y_offsets,
+            Tensor z_lengths,
+            Tensor z_offsets,
+            int max_seq_len,
+            bool allow_tf32
+        ) -> Tensor
+        """
+    )
+
+if "fbgemm::jagged_jagged_bmm_jagged_out" not in torch.library._defs:
+    lib.define(
+        """jagged_jagged_bmm_jagged_out(
+            Tensor x,
+            Tensor y,
+            Tensor x_lengths,
+            Tensor x_offsets,
+            Tensor y_lengths,
+            Tensor y_offsets,
+            Tensor z_lengths,
+            Tensor z_offsets,
+            int max_seq_len,
+            bool allow_tf32
+        ) -> Tensor
+        """
+    )
+
 # NOTE: here we register the op for AutogradCUDA/CPU and CUDA/CPU with the same function
 # however, this is not ideal because in the inference case, we don't need the autograd forward
 # to save the context because we don't need to do backward.
-op_registeration(lib, "sll_jagged_dense_bmm", jagged_dense_bmm, "CUDA")
-op_registeration(lib, "sll_jagged_dense_bmm", jagged_dense_bmm, "AutogradCUDA")
-op_registeration(lib, "sll_jagged_dense_bmm", cpu_jagged_dense_bmm, "CPU")
-op_registeration(lib, "sll_jagged_dense_bmm", cpu_jagged_dense_bmm, "AutogradCPU")
-op_registeration(lib, "sll_jagged_jagged_bmm", jagged_jagged_bmm, "CUDA")
-op_registeration(lib, "sll_jagged_jagged_bmm", jagged_jagged_bmm, "AutogradCUDA")
-op_registeration(lib, "sll_jagged_jagged_bmm", cpu_jagged_jagged_bmm, "CPU")
-op_registeration(lib, "sll_jagged_jagged_bmm", cpu_jagged_jagged_bmm, "AutogradCPU")
-op_registeration(
-    lib, "sll_dense_jagged_cat_jagged_out", dense_jagged_cat_jagged_out, "CUDA"
+register_sll_op(
+    "sll_jagged_dense_bmm",
+    {
+        "CUDA": jagged_dense_bmm,
+        "AutogradCUDA": jagged_dense_bmm,
+        "CPU": cpu_jagged_dense_bmm,
+        "AutogradCPU": cpu_jagged_dense_bmm,
+    },
 )
-op_registeration(
-    lib, "sll_dense_jagged_cat_jagged_out", cpu_dense_jagged_cat_jagged_out, "CPU"
+
+register_sll_op(
+    "sll_jagged_jagged_bmm",
+    {
+        "CUDA": jagged_jagged_bmm,
+        "AutogradCUDA": jagged_jagged_bmm,
+        "CPU": cpu_jagged_jagged_bmm,
+        "AutogradCPU": cpu_jagged_jagged_bmm,
+    },
 )
-op_registeration(
-    lib,
+
+register_sll_op(
+    "sll_dense_jagged_cat_jagged_out",
+    {
+        "CUDA": dense_jagged_cat_jagged_out,
+        "CPU": cpu_dense_jagged_cat_jagged_out,
+    },
+)
+
+register_sll_op(
     "sll_jagged_self_substraction_jagged_out",
-    triton_jagged_self_substraction_jagged_out,
-    "CUDA",
+    {
+        "CUDA": triton_jagged_self_substraction_jagged_out,
+        "CPU": cpu_jagged_self_substraction_jagged_out,
+        "Meta": meta_jagged_self_substraction_jagged_out,
+    },
 )
-op_registeration(
-    lib,
-    "sll_jagged_self_substraction_jagged_out",
-    cpu_jagged_self_substraction_jagged_out,
-    "CPU",
+
+register_sll_op(
+    "sll_jagged2_to_padded_dense",
+    {
+        "CUDA": jagged2_to_padded_dense,
+        "AutogradCUDA": jagged2_to_padded_dense,
+        "CPU": cpu_jagged2_to_padded_dense,
+        "AutogradCPU": cpu_jagged2_to_padded_dense,
+    },
 )
-op_registeration(
-    lib,
-    "sll_jagged_self_substraction_jagged_out",
-    meta_jagged_self_substraction_jagged_out,
-    "Meta",
-)
-op_registeration(lib, "sll_jagged2_to_padded_dense", jagged2_to_padded_dense, "CUDA")
-op_registeration(
-    lib, "sll_jagged2_to_padded_dense", jagged2_to_padded_dense, "AutogradCUDA"
-)
-op_registeration(lib, "sll_jagged2_to_padded_dense", cpu_jagged2_to_padded_dense, "CPU")
-op_registeration(
-    lib, "sll_jagged2_to_padded_dense", cpu_jagged2_to_padded_dense, "AutogradCPU"
-)
-op_registeration(
-    lib,
+
+register_sll_op(
     "sll_jagged_dense_elementwise_mul_jagged_out",
-    jagged_dense_elementwise_mul_jagged_out,
-    "CUDA",
+    {
+        "CUDA": jagged_dense_elementwise_mul_jagged_out,
+        "AutogradCUDA": jagged_dense_elementwise_mul_jagged_out,
+        "CPU": cpu_jagged_dense_elementwise_mul_jagged_out,
+        "AutogradCPU": cpu_jagged_dense_elementwise_mul_jagged_out,
+        "Meta": meta_jagged_dense_elementwise_mul_jagged_out,
+    },
 )
-op_registeration(
-    lib,
-    "sll_jagged_dense_elementwise_mul_jagged_out",
-    jagged_dense_elementwise_mul_jagged_out,
-    "AutogradCUDA",
+
+register_sll_op(
+    "sll_jagged_softmax",
+    {
+        "CUDA": jagged_softmax,
+        "AutogradCUDA": jagged_softmax,
+        "CPU": cpu_jagged_softmax,
+        "AutogradCPU": cpu_jagged_softmax,
+    },
 )
-op_registeration(
-    lib,
-    "sll_jagged_dense_elementwise_mul_jagged_out",
-    cpu_jagged_dense_elementwise_mul_jagged_out,
-    "CPU",
+
+register_sll_op(
+    "sll_jagged2_softmax",
+    {
+        "CUDA": jagged2_softmax,
+        "AutogradCUDA": jagged2_softmax,
+        "CPU": cpu_jagged2_softmax,
+        "AutogradCPU": cpu_jagged2_softmax,
+        "AutogradMeta": meta_jagged2_softmax,
+    },
 )
-op_registeration(
-    lib,
-    "sll_jagged_dense_elementwise_mul_jagged_out",
-    cpu_jagged_dense_elementwise_mul_jagged_out,
-    "AutogradCPU",
+
+register_sll_op(
+    "array_jagged_bmm_jagged_out",
+    {
+        "CUDA": array_jagged_bmm_jagged_out,
+        "AutogradCUDA": array_jagged_bmm_jagged_out,
+        "CPU": cpu_array_jagged_bmm_jagged_out,
+        "AutogradCPU": cpu_array_jagged_bmm_jagged_out,
+        "AutogradMeta": meta_array_jagged_bmm_jagged_out,
+    },
 )
-op_registeration(
-    lib,
-    "sll_jagged_dense_elementwise_mul_jagged_out",
-    meta_jagged_dense_elementwise_mul_jagged_out,
-    "Meta",
+
+register_sll_op(
+    "jagged_jagged_bmm_jagged_out",
+    {
+        "CUDA": jagged_jagged_bmm_jagged_out,
+        "AutogradCUDA": jagged_jagged_bmm_jagged_out,
+        "CPU": cpu_jagged_jagged_bmm_jagged_out,
+        "AutogradCPU": cpu_jagged_jagged_bmm_jagged_out,
+        "AutogradMeta": meta_jagged_jagged_bmm_jagged_out,
+    },
 )

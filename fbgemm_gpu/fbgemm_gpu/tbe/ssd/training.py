@@ -145,6 +145,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         # Set to True to alloc a UVM tensor using malloc+cudaHostRegister.
         # Set to False to use cudaMallocManaged
         uvm_host_mapped: bool = False,
+        enable_async_update: bool = True,  # whether enable L2/rocksdb write to async background thread
     ) -> None:
         super(SSDTableBatchedEmbeddingBags, self).__init__()
 
@@ -427,7 +428,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         logging.info(f"tbe_unique_id: {tbe_unique_id}")
         if not ps_hosts:
             logging.info(
-                f"Logging SSD offloading setup, tbe_unique_id:{tbe_unique_id}, l2_cache_size:{l2_cache_size}GB, "
+                f"Logging SSD offloading setup, tbe_unique_id:{tbe_unique_id}, l2_cache_size:{l2_cache_size}GB, enable_async_update:{enable_async_update}"
                 f"passed_in_path={ssd_directory}, num_shards={ssd_rocksdb_shards},num_threads={ssd_rocksdb_shards},"
                 f"memtable_flush_period={ssd_memtable_flush_period},memtable_flush_offset={ssd_memtable_flush_offset},"
                 f"l0_files_per_compact={ssd_l0_files_per_compact},max_D={self.max_D},rate_limit_mbps={ssd_rate_limit_mbps},"
@@ -459,6 +460,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 use_passed_in_path,
                 tbe_unique_id,
                 l2_cache_size,
+                enable_async_update,
             )
         else:
             # pyre-fixme[4]: Attribute must be annotated.
@@ -1723,25 +1725,20 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
     def flush(self) -> None:
         active_slots_mask = self.lxu_cache_state != -1
 
-        active_slots_mask_cpu = active_slots_mask.cpu()
-        lxu_cache_weights_cpu = self.lxu_cache_weights.cpu()
-        lxu_cache_state_cpu = self.lxu_cache_state.cpu()
-
-        active_weights = lxu_cache_weights_cpu.masked_select(
-            active_slots_mask_cpu.view(-1, 1)
-        ).view(-1, self.max_D)
-        active_ids = lxu_cache_state_cpu.view(-1).masked_select(
-            active_slots_mask_cpu.view(-1)
+        active_weights_gpu = self.lxu_cache_weights[active_slots_mask.view(-1)].view(
+            -1, self.max_D
         )
+        active_ids_gpu = self.lxu_cache_state.view(-1)[active_slots_mask.view(-1)]
+
+        active_weights_cpu = active_weights_gpu.cpu()
+        active_ids_cpu = active_ids_gpu.cpu()
 
         torch.cuda.current_stream().wait_stream(self.ssd_eviction_stream)
 
-        self.ssd_db.set_cuda(
-            active_ids,
-            active_weights,
-            torch.tensor([active_ids.numel()]),
-            self.timestep,
-            False,
+        self.ssd_db.set(
+            active_ids_cpu,
+            active_weights_cpu,
+            torch.tensor([active_ids_cpu.numel()]),
         )
 
         self.ssd_db.flush()
