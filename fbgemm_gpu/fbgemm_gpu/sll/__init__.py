@@ -18,6 +18,7 @@ from fbgemm_gpu.sll.cpu_sll import (  # noqa F401
     cpu_jagged2_to_padded_dense,
     cpu_jagged_dense_bmm,
     cpu_jagged_dense_elementwise_mul_jagged_out,
+    cpu_jagged_flash_attention_basic,
     cpu_jagged_jagged_bmm,
     cpu_jagged_jagged_bmm_jagged_out,
     cpu_jagged_self_substraction_jagged_out,
@@ -39,6 +40,7 @@ from fbgemm_gpu.sll.triton_sll import (  # noqa F401
     jagged2_to_padded_dense,
     jagged_dense_bmm,
     jagged_dense_elementwise_mul_jagged_out,
+    jagged_flash_attention_basic,
     jagged_jagged_bmm,
     jagged_jagged_bmm_jagged_out,
     jagged_softmax,
@@ -183,9 +185,9 @@ if "fbgemm::sll_jagged2_softmax" not in torch.library._defs:
         """
     )
 
-if "fbgemm::array_jagged_bmm_jagged_out" not in torch.library._defs:
+if "fbgemm::sll_array_jagged_bmm_jagged_out" not in torch.library._defs:
     lib.define(
-        """array_jagged_bmm_jagged_out(
+        """sll_array_jagged_bmm_jagged_out(
             Tensor x,
             Tensor y,
             Tensor x_lengths,
@@ -200,9 +202,9 @@ if "fbgemm::array_jagged_bmm_jagged_out" not in torch.library._defs:
         """
     )
 
-if "fbgemm::jagged_jagged_bmm_jagged_out" not in torch.library._defs:
+if "fbgemm::sll_jagged_jagged_bmm_jagged_out" not in torch.library._defs:
     lib.define(
-        """jagged_jagged_bmm_jagged_out(
+        """sll_jagged_jagged_bmm_jagged_out(
             Tensor x,
             Tensor y,
             Tensor x_lengths,
@@ -213,6 +215,20 @@ if "fbgemm::jagged_jagged_bmm_jagged_out" not in torch.library._defs:
             Tensor z_offsets,
             int max_seq_len,
             bool allow_tf32
+        ) -> Tensor
+        """
+    )
+
+if "fbgemm::sll_jagged_flash_attention_basic" not in torch.library._defs:
+    lib.define(
+        """sll_jagged_flash_attention_basic(
+            Tensor q_weights,
+            Tensor k_weights,
+            Tensor v_weights,
+            Tensor offsets,
+            int max_seq_len,
+            bool use_mask=False,
+            bool allow_tf32=True
         ) -> Tensor
         """
     )
@@ -300,7 +316,7 @@ register_sll_op(
 )
 
 register_sll_op(
-    "array_jagged_bmm_jagged_out",
+    "sll_array_jagged_bmm_jagged_out",
     {
         "CUDA": array_jagged_bmm_jagged_out,
         "AutogradCUDA": array_jagged_bmm_jagged_out,
@@ -311,12 +327,22 @@ register_sll_op(
 )
 
 register_sll_op(
-    "jagged_jagged_bmm_jagged_out",
+    "sll_jagged_jagged_bmm_jagged_out",
     {
         "CUDA": jagged_jagged_bmm_jagged_out,
         "AutogradCUDA": jagged_jagged_bmm_jagged_out,
         "CPU": cpu_jagged_jagged_bmm_jagged_out,
         "AutogradCPU": cpu_jagged_jagged_bmm_jagged_out,
         "AutogradMeta": meta_jagged_jagged_bmm_jagged_out,
+    },
+)
+
+register_sll_op(
+    "sll_jagged_flash_attention_basic",
+    {
+        "CUDA": jagged_flash_attention_basic,
+        "AutogradCUDA": jagged_flash_attention_basic,
+        "CPU": cpu_jagged_flash_attention_basic,
+        "AutogradCPU": cpu_jagged_flash_attention_basic,
     },
 )
